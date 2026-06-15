@@ -1,7 +1,8 @@
 from pathlib import Path
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+home = Path.home()
+PROJECT_ROOT = home / "AMS_Project"
 PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
 
 IMAGE_DIR = PROCESSED_DIR / "images"
