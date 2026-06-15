@@ -8,11 +8,11 @@ from skimage.morphology import binary_dilation, ball
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-PROCESSED_DIR = PROJECT_ROOT / "datasets" / "processed_airrc"
+PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
 IMAGE_DIR = PROCESSED_DIR / "images"
 TARGET_DIR = PROCESSED_DIR / "targets"
 
-PATCH_DIR = PROJECT_ROOT / "datasets" / "airrc_patches"
+PATCH_DIR = PROJECT_ROOT / "datasets_new" / "airrc_patches"
 PATCH_IMAGE_DIR = PATCH_DIR / "images"
 PATCH_TARGET_DIR = PATCH_DIR / "targets"
 SPLIT_DIR = PATCH_DIR / "splits"
