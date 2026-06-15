@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PROCESSED_DIR = PROJECT_ROOT / "datasets" / "processed_airrc"
+PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
 
 IMAGE_DIR = PROCESSED_DIR / "images"
 TARGET_DIR = PROCESSED_DIR / "targets"
