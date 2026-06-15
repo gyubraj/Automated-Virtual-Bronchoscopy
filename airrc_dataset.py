@@ -33,8 +33,10 @@ class AirRCPatchDataset(Dataset):
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
-    root = Path(__file__).resolve().parent
-    train_json = root / "datasets_new" / "airrc_patches" / "splits" / "train.json"
+    home = Path.home()
+    root = home / "AMS_Project" / "datasets_new"
+
+    train_json = root / "airrc_patches" / "splits" / "train.json"
 
     dataset = AirRCPatchDataset(train_json)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)

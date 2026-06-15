@@ -1,2 +1,6 @@
-datasets/
+saved_model/
+AMS_Implementation_Steps.pdf
 idc_env/
+__pycache__/
+docker/
+data/

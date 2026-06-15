@@ -119,8 +119,11 @@ def train():
     learning_rate = 1e-4
     weight_decay = 1e-4
 
-    train_json = "datasets/airrc_patches/splits/train.json"
-    val_json = "datasets/airrc_patches/splits/val.json"
+    home = Path.home()
+    PROJECT_ROOT = home / "AMS_Project"
+
+    train_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "train.json"
+    val_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "val.json"
     save_dir = Path("./saved_model")
     save_dir.mkdir(parents=True, exist_ok=True)
 
