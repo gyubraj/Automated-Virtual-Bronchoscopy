@@ -4,8 +4,8 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent
+home = Path.home()
+PROJECT_ROOT = home / "AMS_Project"
 
 AIRRC_DIR = PROJECT_ROOT / "datasets_new" / "airrc"
 LABEL_DIR = AIRRC_DIR / "labelsTr"

@@ -1,327 +1,272 @@
-import numpy as np
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-import os
-from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from torch.nn.functional import cross_entropy, sigmoid, binary_cross_entropy
+from torch.utils.data import DataLoader
+
 from WingsNet import WingsNet
-from Data import CropSegData, SegValData, SegValCropData
-import skimage.measure as measure
-import nibabel
-from skimage.morphology import skeletonize_3d
-import SimpleITK as sitk
+from airrc_dataset import AirRCPatchDataset
 
-def dice_loss(pred, target):
-    smooth = 1.
-    iflat = pred.view(-1)
-    tflat = target.view(-1)
-    intersection = ((iflat) * tflat).sum()
 
-    return 1 - ((2. * intersection + smooth) / ((iflat).sum() + (tflat).sum() + smooth))
+# Boundary-aware loss settings. These can be tuned after a short validation run.
+WALL_POSITIVE_WEIGHT = 2.0
+BOUNDARY_WEIGHT = 5.0
+BOUNDARY_KERNEL_SIZE = 3
 
-def Tversky_loss(pred, target):
+
+def dice_loss(pred, target, weight=None):
+    """Soft Dice loss averaged across the lumen and wall channels."""
     smooth = 1.0
-    alpha = 0.05
-    beta = 1 - alpha
-    intersection = (pred * target).sum()
-    FP = (pred * (1 - target)).sum()
-    FN = ((1 - pred) * target).sum()
-    return 1 - (intersection + smooth) / (intersection + alpha * FP + beta * FN + smooth)
+    dims = (0, 2, 3, 4)
 
-def general_union_loss(pred, target, dist):
-    weight = dist * target + (1 - target)
-    # when weight = 1, this loss becomes Root Tversky loss
-    smooth = 1.0
-    alpha = 0.1  # alpha=0.1 in stage1 and 0.2 in stage2
-    beta = 1 - alpha
-    sigma1 = 0.0001
-    sigma2 = 0.0001
-    weight_i = target * sigma1 + (1 - target) * sigma2
-    intersection = (weight * ((pred + weight_i) ** 0.7) * target).sum()
-    intersection2 = (weight * (alpha * pred + beta * target)).sum()
-    return 1 - (intersection + smooth) / (intersection2 + smooth)
+    if weight is None:
+        weight = torch.ones_like(target)
+
+    intersection = (weight * pred * target).sum(dim=dims)
+    denominator = (weight * pred).sum(dim=dims) + (weight * target).sum(dim=dims)
+    dice = (2.0 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - dice.mean()
+
+
+def channel_dice(pred, target):
+    """Unweighted Dice metrics for clear lumen/wall reporting."""
+    lumen_dice = 1.0 - dice_loss(pred[:, 0:1], target[:, 0:1])
+    wall_dice = 1.0 - dice_loss(pred[:, 1:2], target[:, 1:2])
+    return lumen_dice, wall_dice
+
+
+def morphological_boundary(mask, kernel_size=BOUNDARY_KERNEL_SIZE):
+    """Create a one-voxel-scale 3D boundary band from a binary target mask."""
+    padding = kernel_size // 2
+    dilated = F.max_pool3d(mask, kernel_size, stride=1, padding=padding)
+    eroded = 1.0 - F.max_pool3d(
+        1.0 - mask,
+        kernel_size,
+        stride=1,
+        padding=padding,
+    )
+    return (dilated - eroded).clamp(0.0, 1.0)
+
+
+def make_boundary_weights(target):
+    """Build channel-specific weights around the lumen-wall interface and wall edge."""
+    lumen = target[:, 0:1].clamp(0.0, 1.0)
+    wall = target[:, 1:2].clamp(0.0, 1.0)
+
+    lumen_dilated = F.max_pool3d(
+        lumen,
+        BOUNDARY_KERNEL_SIZE,
+        stride=1,
+        padding=BOUNDARY_KERNEL_SIZE // 2,
+    )
+    wall_dilated = F.max_pool3d(
+        wall,
+        BOUNDARY_KERNEL_SIZE,
+        stride=1,
+        padding=BOUNDARY_KERNEL_SIZE // 2,
+    )
+
+    # Include voxels on both sides of the transition between lumen and wall.
+    interface = torch.maximum(lumen_dilated * wall, lumen * wall_dilated)
+    wall_boundary = morphological_boundary(wall)
+
+    weights = torch.ones_like(target)
+    weights[:, 0:1] += BOUNDARY_WEIGHT * interface
+    weights[:, 1:2] += WALL_POSITIVE_WEIGHT * wall
+    weights[:, 1:2] += BOUNDARY_WEIGHT * torch.maximum(interface, wall_boundary)
+    return weights
+
+
+def boundary_aware_loss(logits, target):
+    """Weighted BCE plus weighted Dice for lumen and wall prediction."""
+    weights = make_boundary_weights(target)
+
+    voxel_bce = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+    )
+    weighted_bce = (voxel_bce * weights).sum() / weights.sum().clamp_min(1.0)
+
+    probability = torch.sigmoid(logits)
+    weighted_dice = dice_loss(probability, target, weight=weights)
+    return weighted_bce + weighted_dice
+
+
+def unpack_batch(batch):
+    if isinstance(batch, dict):
+        image = batch["image"]
+        target = batch["target"]
+    else:
+        image = batch[0]
+        target = batch[1]
+
+    image = image.float()
+    target = target.float()
+
+    if image.ndim != 5 or image.shape[1] != 1:
+        raise ValueError(f"Expected image shape [B, 1, D, H, W], got {tuple(image.shape)}")
+    if target.ndim != 5 or target.shape[1] != 2:
+        raise ValueError(f"Expected target shape [B, 2, D, H, W], got {tuple(target.shape)}")
+
+    return image, target
+
+
 
 def train():
-    max_epoches = 100
-    batch_size = 16
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
-    file_path = './data/base_dict.json'
-    data_root = './data'
+    max_epochs = 100
+    batch_size = 2
+    learning_rate = 1e-4
+    weight_decay = 1e-4
 
-    def worker_init_fn(worker_id):
-        np.random.seed(1 + worker_id)
-    model = WingsNet(in_channel=2, n_classes=1)
-    train_dataset = CropSegData(file_path=file_path, data_root=data_root, batch_size=batch_size)
-    train_data_loader = DataLoader(dataset=train_dataset, batch_size=1, shuffle=True, num_workers=4,
-                                   pin_memory=True, drop_last=True)
-    valid_dataset = SegValCropData(file_path, data_root, batch_size=8, cube_size = 128, step = 64)
-    valid_dataloader = DataLoader(dataset=valid_dataset, batch_size=8, shuffle=False, num_workers=4,
-                                  pin_memory=True, drop_last=True)
+    home = Path.home()
+    PROJECT_ROOT = home / "AMS_Project"
 
-    max_step = len(train_dataset) * max_epoches
-    # optimizer = torch.optim.SGD(model.parameters(), momentum=0.9, weight_decay=0.0001, lr=0.01)
-    # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60, 90], gamma=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-    # resume
-    weights_dict = torch.load(os.path.join('./saved_model', 'wingsnet_79.pth'))
-    model.load_state_dict(weights_dict, strict=False)
-    model = torch.nn.DataParallel(model).cuda()
-    model.train()
+    train_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "train.json"
+    val_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "val.json"
+    save_dir = Path("./saved_model")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    for ep in range(0, max_epoches):
-        for iter, pack in enumerate(train_data_loader):
-            data = pack[0].float().cuda()
-            data2 = pack[1].float().cuda()
-            label = pack[2].float().cuda()
-            weight = pack[3].float().cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
 
-            data = data.transpose(0, 1)
-            data2 = data2.transpose(0, 1)
-            label = label.transpose(0, 1)
-            weight = weight.transpose(0, 1)
-            data = torch.cat([data, data2], dim=1)
+    train_dataset = AirRCPatchDataset(train_json)
+    valid_dataset = AirRCPatchDataset(val_json)
 
-            pred_en, pred_de = model(data)
-            pred_en = torch.sigmoid(pred_en)
-            pred_de = torch.sigmoid(pred_de)
-            dice_loss_en = dice_loss(pred_en, label)
-            dice_loss_de = dice_loss(pred_de, label)
-            loss = dice_loss_de + dice_loss_en
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=device.type == "cuda",
+        drop_last=True,
+    )
+    valid_loader = DataLoader(
+        dataset=valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+    )
+
+    model = WingsNet(in_channel=1, n_classes=2).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    best_val_loss = float("inf")
+
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_lumen_dice_sum = 0.0
+        train_wall_dice_sum = 0.0
+        train_count = 0
+
+        for iteration, batch in enumerate(train_loader):
+            image, target = unpack_batch(batch)
+            image = image.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            pred_en, pred_de = model(image)
+
+            loss_en = boundary_aware_loss(pred_en, target)
+            loss_de = boundary_aware_loss(pred_de, target)
+            loss = loss_de + 0.5 * loss_en
 
             loss.backward()
             optimizer.step()
-            # scheduler.step()
-            optimizer.zero_grad()
-            if iter % 10 == 0:
-                print('epoch:', ep, iter + ep * len(train_dataset), '/', max_step,
-                      'loss:', loss.item(), 'dice loss encode:', dice_loss_en.item(),
-                      'dice loss decode:', dice_loss_de.item())
-            torch.cuda.empty_cache()
-            # break
 
-        print('')
-        validation(model, valid_dataloader, ep)
-        print('')
-        torch.save(model.module.state_dict(),
-                   os.path.join('./saved_model', 'wingsnet_' + str(ep) + '.pth'))
+            with torch.no_grad():
+                pred_de_prob = torch.sigmoid(pred_de)
+                lumen_dice, wall_dice = channel_dice(pred_de_prob, target)
 
-def validation(model, valid_dataloader, epoch):
-    model.train()
-    # sliding window
-    sens, pres, branches, dices = [], [], [], []
-    last_name = ''
-    flag = False
+            current_batch_size = image.shape[0]
+            train_loss_sum += loss.item() * current_batch_size
+            train_lumen_dice_sum += lumen_dice.item() * current_batch_size
+            train_wall_dice_sum += wall_dice.item() * current_batch_size
+            train_count += current_batch_size
+
+            if iteration % 10 == 0:
+                print(
+                    "epoch: %d, iter: %d/%d, boundary loss: %.4f, "
+                    "lumen dice: %.4f, wall dice: %.4f"
+                    % (
+                        epoch,
+                        iteration,
+                        len(train_loader),
+                        train_loss_sum / max(train_count, 1),
+                        train_lumen_dice_sum / max(train_count, 1),
+                        train_wall_dice_sum / max(train_count, 1),
+                    )
+                )
+
+        val_loss, val_lumen_dice, val_wall_dice = validation(
+            model=model,
+            valid_loader=valid_loader,
+            device=device,
+        )
+
+        print(
+            "epoch: %d, val boundary loss: %.4f, "
+            "val lumen dice: %.4f, val wall dice: %.4f"
+            % (epoch, val_loss, val_lumen_dice, val_wall_dice)
+        )
+
+        training_checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": val_loss,
+            "val_lumen_dice": val_lumen_dice,
+            "val_wall_dice": val_wall_dice,
+        }
+        torch.save(model.state_dict(), save_dir / "wingsnet_latest.pth")
+        torch.save(training_checkpoint, save_dir / "wingsnet_latest_checkpoint.pth")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), save_dir / "wingsnet_best.pth")
+            torch.save(training_checkpoint, save_dir / "wingsnet_best_checkpoint.pth")
+
+
+def validation(model, valid_loader, device):
+    model.eval()
+    val_loss_sum = 0.0
+    val_lumen_dice_sum = 0.0
+    val_wall_dice_sum = 0.0
+    val_count = 0
+
     with torch.no_grad():
-        for i, (x, name, pos) in enumerate(valid_dataloader):
-            name = name[0]
-            # if name == 'ATM_093_0000': flag = True
-            # if flag == False: continue
-            if name != last_name:
-                if last_name != '':
-                    pred = pred / pred_num
-                    pred[pred >= 0.5] = 1
-                    pred[pred < 0.5] = 0
-                    pred = np.squeeze(pred)
-                    # np.save(os.path.join('./data/pred', last_name + '.npy'), pred)
-                    # print(2 * (pred * label).sum() / ((pred + label).sum() + 1))
-                    sen, pre, branch, dice = evaluation_case(pred, label, last_name)
-                    sens.append(sen)
-                    pres.append(pre)
-                    branches.append(branch)
-                    dices.append(dice)
+        for batch in valid_loader:
+            image, target = unpack_batch(batch)
+            image = image.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
 
-                label = sitk.ReadImage(os.path.join('./data/c_mask', name+'.nii.gz'))
-                label = sitk.GetArrayFromImage(label)
-                pred = np.zeros(label.shape)
-                pred = pred[np.newaxis, np.newaxis, ...]
-                pred_num = np.zeros(pred.shape)
-                last_name = name
+            pred_en, pred_de = model(image)
+            loss_en = boundary_aware_loss(pred_en, target)
+            loss_de = boundary_aware_loss(pred_de, target)
+            loss = loss_de + 0.5 * loss_en
 
-            x = x.cuda()
-            p0, p = model(x)
-            p = torch.sigmoid(p)
-            p = p.cpu().detach().numpy()
-            pos = pos.numpy()
-            for i in range(len(pos)):
-                # print(pos)
-                xl, xr, yl, yr, zl, zr = pos[i,0], pos[i,1], pos[i,2], pos[i,3], pos[i,4], pos[i,5]
-                pred[0, :, xl:xr, yl:yr, zl:zr] += p[i]
-                pred_num[0, :, xl:xr, yl:yr, zl:zr] += 1
+            pred_de_prob = torch.sigmoid(pred_de)
+            lumen_dice, wall_dice = channel_dice(pred_de_prob, target)
 
-        pred = pred / pred_num
-        pred[pred >= 0.5] = 1
-        pred[pred < 0.5] = 0
-        pred = np.squeeze(pred)
-        # np.save(os.path.join('./data/pred', last_name + '.npy'), pred)
-        # print(2 * (pred * label).sum() / ((pred + label).sum() + 1))
-        # return
-        sen, pre, branch, dice = evaluation_case(pred, label, last_name)
-        sens.append(sen)
-        pres.append(pre)
-        branches.append(branch)
-        dices.append(dice)
+            current_batch_size = image.shape[0]
+            val_loss_sum += loss.item() * current_batch_size
+            val_lumen_dice_sum += lumen_dice.item() * current_batch_size
+            val_wall_dice_sum += wall_dice.item() * current_batch_size
+            val_count += current_batch_size
 
-        sen_mean = np.mean(sens)
-        sen_std = np.std(sens)
-        pre_mean = np.mean(pres)
-        pre_std = np.std(pres)
-        branch_mean = np.mean(branches)
-        branch_std = np.std(branches)
-        dice_mean = np.mean(dices)
-        dice_std = np.std(dices)
-        print("len mean: %0.4f (%0.4f), branch: %0.4f (%0.4f), pre: %0.4f (%0.4f), dice: %0.4f (%0.4f)" % (
-               sen_mean, sen_std, branch_mean, branch_std, pre_mean, pre_std, dice_mean, dice_std))
-        line = "len mean: %0.4f (%0.4f), branch: %0.4f (%0.4f), pre: %0.4f (%0.4f), dice: %0.4f (%0.4f)" % ( \
-               sen_mean, sen_std, branch_mean, branch_std, pre_mean, pre_std, dice_mean, dice_std)
-        with open('./log.txt', 'a') as file:
-            file.writelines(['epoch:' + str(epoch)+'\n', line+'\n', '\n'])
-
-def evaluation_case(pred, label, name):
-    parsing = sitk.ReadImage(os.path.join('./data', 'tree_parse_valid', name + '.nii.gz'))
-    parsing = sitk.GetArrayFromImage(parsing)
-    if len(pred.shape) > 3:
-        pred = pred[0]
-    if len(label.shape) > 3:
-        label = label[0]
-    cd, num = measure.label(pred, return_num=True, connectivity=1)
-    volume = np.zeros([num])
-    for k in range(num):
-        volume[k] = ((cd == (k + 1)).astype(np.uint8)).sum()
-    volume_sort = np.argsort(volume)
-    # print(volume_sort)
-    large_cd = (cd == (volume_sort[-1] + 1)).astype(np.uint8)
-
-    # skeleton = skeletonize_3d(label)
-    skeleton = sitk.ReadImage(os.path.join('./data', 'skeleton', name + '.nii.gz'))
-    skeleton = sitk.GetArrayFromImage(skeleton)
-    skeleton = (skeleton > 0)
-    skeleton = skeleton.astype('uint8')
-
-    # print(pred.shape, label.shape, skeleton.shape)
-    sen = (large_cd * skeleton).sum() / skeleton.sum()
-    pre = (large_cd * label).sum() / large_cd.sum()
-
-    num_branch = parsing.max()
-    detected_num = 0
-    # for j in range(num_branch):
-    #     branch_label = ((parsing == (j + 1)).astype(int)) * skeleton
-    #     if (large_cd * branch_label).sum() / branch_label.sum() >= 0.8:
-    #         detected_num += 1
-    branch_label = parsing * skeleton
-    branch_pred = branch_label * large_cd
-    label_value_dic = dict(zip(*np.unique(branch_label, return_counts=True)))
-    pred_value, pred_count = np.unique(branch_pred, return_counts=True)
-    for j in range(len(pred_value)):
-        if pred_value[j] == 0: continue
-        if pred_count[j] / label_value_dic[pred_value[j]] >= 0.8:
-            detected_num += 1
-
-    branch = detected_num / num_branch
-
-    dice = 2 * (pred * label).sum() / ((pred + label).sum() + 1)
-
-    print(name, "Length: %0.4f" % (sen), "Precision: %0.4f" % (pre), "Branch: %0.4f" % (branch),
-          "Dice: %0.4f" % (dice))
-    return sen, pre, branch, dice
-
-def test():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
-    file_path = './data/test.json'
-    data_root = './data'
-
-    def worker_init_fn(worker_id):
-        np.random.seed(1 + worker_id)
-
-    model = WingsNet(in_channel=2, n_classes=1)
-
-    valid_dataset = SegValCropData(file_path, data_root, batch_size=8, cube_size=128, step=64)
-    valid_dataloader = DataLoader(dataset=valid_dataset, batch_size=8, shuffle=False, num_workers=4,
-                                  pin_memory=True, drop_last=True)
-    # resume
-    folder_name = '0816_adddice'
-    os.mkdir(os.path.join('./result', folder_name))
-    weights_dict = torch.load(os.path.join('./saved_model', folder_name, 'wingsnet_18.pth'))
-    model.load_state_dict(weights_dict, strict=False)
-    model = torch.nn.DataParallel(model).cuda()
-    model.train()
-
-    last_name = ''
-    flag = False
-    with torch.no_grad():
-        for i, (x, name, pos) in enumerate(valid_dataloader):
-            name = name[0]
-            if name != last_name:
-                if last_name != '':
-                    print(last_name)
-                    pred = pred / pred_num
-                    pred = pred[0, 0]
-                    np.save(os.path.join('./result', folder_name, last_name + '.npy'), pred)
-                    pred[pred >= 0.5] = 1
-                    pred[pred < 0.5] = 0
-                    pred_img = sitk.GetImageFromArray(pred.astype(np.byte))
-                    pred_img.SetOrigin(img.GetOrigin())
-                    pred_img.SetDirection(img.GetDirection())
-                    pred_img.SetSpacing(img.GetSpacing())
-                    sitk.WriteImage(pred_img, os.path.join('./result', folder_name, last_name + '.nii.gz'))
-
-                img = sitk.ReadImage(os.path.join('./data/c_img', name + '.nii.gz'))
-                arr = sitk.GetArrayFromImage(img)
-                pred = np.zeros(arr.shape)
-                pred = pred[np.newaxis, np.newaxis, ...]
-                pred_num = np.zeros(pred.shape)
-                last_name = name
-
-            x = x.cuda()
-            p0, p = model(x)
-            p = torch.sigmoid(p)
-            p = p.cpu().detach().numpy()
-            pos = pos.numpy()
-            for i in range(len(pos)):
-                # print(pos)
-                xl, xr, yl, yr, zl, zr = pos[i, 0], pos[i, 1], pos[i, 2], pos[i, 3], pos[i, 4], pos[i, 5]
-                pred[0, :, xl:xr, yl:yr, zl:zr] += p[i]
-                pred_num[0, :, xl:xr, yl:yr, zl:zr] += 1
-
-        pred = pred / pred_num
-        pred = pred[0, 0]
-        np.save(os.path.join('./result', folder_name, last_name + '.npy'), pred)
-        pred_img = sitk.GetImageFromArray(pred.astype(np.byte))
-        pred_img.SetOrigin(img.GetOrigin())
-        pred_img.SetDirection(img.GetDirection())
-        pred_img.SetSpacing(img.GetSpacing())
-        pred[pred >= 0.5] = 1
-        pred[pred < 0.5] = 0
-        sitk.WriteImage(pred_img, os.path.join('./result', folder_name, last_name + '.nii.gz'))
-
-if __name__ == '__main__':
-    # train()
-    test()
+    return (
+        val_loss_sum / max(val_count, 1),
+        val_lumen_dice_sum / max(val_count, 1),
+        val_wall_dice_sum / max(val_count, 1),
+    )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    train()
