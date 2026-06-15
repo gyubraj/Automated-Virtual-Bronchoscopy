@@ -3,14 +3,16 @@ import json
 import random
 
 import numpy as np
+from skimage.morphology import binary_dilation, ball
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-PROCESSED_DIR = PROJECT_ROOT / "datasets" / "processed_airrc"
+PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
 IMAGE_DIR = PROCESSED_DIR / "images"
 TARGET_DIR = PROCESSED_DIR / "targets"
 
-PATCH_DIR = PROJECT_ROOT / "datasets" / "airrc_patches"
+PATCH_DIR = PROJECT_ROOT / "datasets_new" / "airrc_patches"
 PATCH_IMAGE_DIR = PATCH_DIR / "images"
 PATCH_TARGET_DIR = PATCH_DIR / "targets"
 SPLIT_DIR = PATCH_DIR / "splits"
@@ -20,7 +22,8 @@ PATCHES_PER_CASE = 12
 VAL_RATIO = 0.2
 SEED = 42
 
-FOREGROUND_PATCH_FRACTION = 0.8
+BOUNDARY_PATCH_FRACTION = 0.8
+DILATION_RADIUS = 3
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -63,13 +66,9 @@ def crop_patch(ct, target, center, patch_size):
     z, y, x = center
     pd, ph, pw = patch_size
 
-    z0 = z - pd // 2
-    y0 = y - ph // 2
-    x0 = x - pw // 2
-
-    z0 = min(max(z0, 0), ct.shape[0] - pd)
-    y0 = min(max(y0, 0), ct.shape[1] - ph)
-    x0 = min(max(x0, 0), ct.shape[2] - pw)
+    z0 = min(max(z - pd // 2, 0), ct.shape[0] - pd)
+    y0 = min(max(y - ph // 2, 0), ct.shape[1] - ph)
+    x0 = min(max(x - pw // 2, 0), ct.shape[2] - pw)
 
     z1 = z0 + pd
     y1 = y0 + ph
@@ -81,26 +80,48 @@ def crop_patch(ct, target, center, patch_size):
     return ct_patch, target_patch
 
 
-def random_center(shape, patch_size):
+def random_center(shape):
     d, h, w = shape
-    pd, ph, pw = patch_size
 
-    z = random.randint(pd // 2, max(pd // 2, d - pd // 2 - 1))
-    y = random.randint(ph // 2, max(ph // 2, h - ph // 2 - 1))
-    x = random.randint(pw // 2, max(pw // 2, w - pw // 2 - 1))
+    return (
+        random.randint(0, d - 1),
+        random.randint(0, h - 1),
+        random.randint(0, w - 1),
+    )
 
-    return z, y, x
 
+def boundary_center(target):
+    lumen = target[0] > 0
+    wall = target[1] > 0
 
-def foreground_center(target):
-    airway = (target[0] > 0) | (target[1] > 0)
-    coords = np.argwhere(airway)
+    # Prefer locations where the lumen expands into the wall region.
+    # These are the patches most relevant for learning the lumen-wall boundary.
+    dilated_lumen = binary_dilation(lumen, ball(DILATION_RADIUS))
+    boundary_region = dilated_lumen & wall
+
+    coords = np.argwhere(boundary_region)
+
+    # Fallback: if the boundary region is empty, sample any airway voxel.
+    if coords.size == 0:
+        airway = lumen | wall
+        coords = np.argwhere(airway)
 
     if coords.size == 0:
         return None
 
     idx = random.randint(0, len(coords) - 1)
     return tuple(int(v) for v in coords[idx])
+
+
+def choose_patch_center(ct_shape, target):
+    use_boundary = random.random() < BOUNDARY_PATCH_FRACTION
+
+    if use_boundary:
+        center = boundary_center(target)
+        if center is not None:
+            return center
+
+    return random_center(ct_shape)
 
 
 def extract_case(uid, image_path, target_path):
@@ -112,11 +133,7 @@ def extract_case(uid, image_path, target_path):
     saved = []
 
     for patch_idx in range(PATCHES_PER_CASE):
-        use_foreground = random.random() < FOREGROUND_PATCH_FRACTION
-        center = foreground_center(target) if use_foreground else None
-
-        if center is None:
-            center = random_center(ct.shape, PATCH_SIZE)
+        center = choose_patch_center(ct.shape, target)
 
         ct_patch, target_patch = crop_patch(ct, target, center, PATCH_SIZE)
 
@@ -126,7 +143,8 @@ def extract_case(uid, image_path, target_path):
         if target_patch.shape != (2, *PATCH_SIZE):
             raise RuntimeError(f"Bad target patch shape for {uid}: {target_patch.shape}")
 
-        ct_patch = ct_patch[None, ...]  # 1, D, H, W
+        ct_patch = ct_patch[None, ...].astype(np.float32)
+        target_patch = target_patch.astype(np.uint8)
 
         patch_id = f"{uid}_patch{patch_idx:03d}"
 
@@ -153,6 +171,11 @@ def extract_case(uid, image_path, target_path):
 
 def main():
     image_files = sorted(IMAGE_DIR.glob("*_ct.npy"))
+
+    print(f"Found {len(image_files)} processed CT files")
+    print(f"Patch size: {PATCH_SIZE}")
+    print(f"Patches per case: {PATCHES_PER_CASE}")
+    print(f"Boundary patch fraction: {BOUNDARY_PATCH_FRACTION}")
 
     all_patches = []
 
@@ -185,6 +208,7 @@ def main():
     print("  train patches:", len(train_patches))
     print("  val patches:", len(val_patches))
     print("  output:", PATCH_DIR)
+
 
 if __name__ == "__main__":
     main()

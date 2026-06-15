@@ -7,12 +7,12 @@ import SimpleITK as sitk
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-AIRRC_DIR = PROJECT_ROOT / "datasets" / "airrc"
+AIRRC_DIR = PROJECT_ROOT / "datasets_new" / "airrc"
 LABEL_DIR = AIRRC_DIR / "labelsTr"
 
-DICOM_ROOT = PROJECT_ROOT / "datasets" / "lidc" / "lidc_idri"
+DICOM_ROOT = PROJECT_ROOT / "datasets_new" / "lidc" / "lidc_idri"
 
-OUT_DIR = PROJECT_ROOT / "datasets" / "processed_airrc"
+OUT_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
 IMAGE_OUT = OUT_DIR / "images"
 TARGET_OUT = OUT_DIR / "targets"
 META_OUT = OUT_DIR / "metadata"
