@@ -120,7 +120,11 @@ def load_checkpoint(model, checkpoint_path, device):
     if not isinstance(checkpoint, dict):
         raise RuntimeError("Checkpoint does not contain a valid state_dict.")
 
-    model.load_state_dict(clean_state_dict(checkpoint), strict=False)
+    missing, unexpected = model.load_state_dict(clean_state_dict(checkpoint), strict=False)
+    if missing:
+        print("[WARN] Missing checkpoint keys:", len(missing))
+    if unexpected:
+        print("[WARN] Unexpected checkpoint keys:", len(unexpected))
     model.to(device)
     model.eval()
     return model
@@ -182,7 +186,9 @@ def make_weight_window(patch_size):
 
 def get_model_output_tensor(output):
     if isinstance(output, (tuple, list)):
-        output = output[0]
+        # WingsNet/TIMI-style models can return deep-supervision outputs.
+        # Training/evaluation use the final output head, so inference must too.
+        output = output[-1]
     if isinstance(output, dict):
         for key in ("out", "output", "pred", "logits"):
             if key in output:
