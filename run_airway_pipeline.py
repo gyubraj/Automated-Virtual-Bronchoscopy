@@ -63,9 +63,15 @@ def main():
     parser.add_argument("--prune-length", type=float, default=8.0, help="Remove terminal centerline branches shorter than this")
     parser.add_argument(
         "--root-mode",
-        choices=["min-z", "max-z", "center-min-z", "center-max-z"],
+        choices=["min-z", "max-z", "center-min-z", "center-max-z", "largest-radius", "timi-trachea"],
         default="center-min-z",
         help="Root selection mode for path planning",
+    )
+    parser.add_argument(
+        "--trachea-root-end",
+        choices=["min-z", "max-z"],
+        default="min-z",
+        help="Which parsed trachea end to use when --root-mode timi-trachea",
     )
     parser.add_argument(
         "--target-mode",
@@ -139,6 +145,8 @@ def main():
         str(args.prune_length),
         "--root-mode",
         args.root_mode,
+        "--trachea-root-end",
+        args.trachea_root_end,
         "--target-mode",
         args.target_mode,
     ]

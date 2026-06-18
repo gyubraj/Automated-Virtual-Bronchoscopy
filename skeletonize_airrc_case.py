@@ -272,7 +272,110 @@ def graph_to_skeleton(graph, shape):
     return skeleton
 
 
-def choose_root(graph, mode, manual_root=None):
+def parse_skeleton_branches(skeleton, min_branch_voxels=5):
+    neighbor_filter = ndi.generate_binary_structure(3, 3)
+    neighbor_count = ndi.convolve(skeleton.astype(np.uint8), neighbor_filter) * skeleton
+    skeleton_parse = skeleton.copy().astype(np.uint8)
+    skeleton_parse[neighbor_count > 3] = 0
+
+    structure = ndi.generate_binary_structure(3, 3)
+    branch_labels, num_branches = ndi.label(skeleton_parse, structure=structure)
+
+    for branch_id in range(1, num_branches + 1):
+        if int((branch_labels == branch_id).sum()) < min_branch_voxels:
+            skeleton_parse[branch_labels == branch_id] = 0
+
+    branch_labels, num_branches = ndi.label(skeleton_parse, structure=structure)
+    return skeleton_parse.astype(np.uint8), branch_labels.astype(np.uint16), int(num_branches)
+
+
+def assign_lumen_to_skeleton_branches(mask, skeleton_parse, branch_labels):
+    _, nearest = ndi.distance_transform_edt(1 - skeleton_parse, return_indices=True)
+    tree_labels = branch_labels[nearest[0], nearest[1], nearest[2]] * mask.astype(np.uint8)
+    return tree_labels.astype(np.uint16)
+
+
+def locate_trachea_branch(tree_labels, num_branches):
+    if num_branches == 0:
+        return None
+
+    volumes = np.zeros(num_branches, dtype=np.int64)
+    for branch_id in range(1, num_branches + 1):
+        volumes[branch_id - 1] = int((tree_labels == branch_id).sum())
+
+    if int(volumes.max()) == 0:
+        return None
+
+    return int(np.argmax(volumes) + 1)
+
+
+def choose_timi_trachea_root(graph, mask, skeleton, root_end="min-z", min_branch_voxels=5):
+    skeleton_parse, branch_labels, num_branches = parse_skeleton_branches(
+        skeleton,
+        min_branch_voxels=min_branch_voxels,
+    )
+    tree_labels = assign_lumen_to_skeleton_branches(mask, skeleton_parse, branch_labels)
+    trachea_branch = locate_trachea_branch(tree_labels, num_branches)
+
+    if trachea_branch is None:
+        return None, {
+            "trachea_branch": None,
+            "parsed_branch_count": int(num_branches),
+            "candidate_count": 0,
+        }
+
+    node_by_id = {node["id"]: node for node in graph["nodes"]}
+    coords = np.array([node["zyx"] for node in graph["nodes"]], dtype=np.float64)
+    center_yx = coords[:, 1:].mean(axis=0)
+
+    endpoints = graph["endpoints"] or [node["id"] for node in graph["nodes"]]
+    endpoint_candidates = []
+    node_candidates = []
+
+    for node in graph["nodes"]:
+        z, y, x = node["zyx"]
+        if branch_labels[z, y, x] != trachea_branch:
+            continue
+        node_candidates.append(node["id"])
+        if node["id"] in endpoints:
+            endpoint_candidates.append(node["id"])
+
+    candidates = endpoint_candidates or node_candidates
+    if not candidates:
+        branch_coords = np.argwhere(branch_labels == trachea_branch)
+        if len(branch_coords) == 0:
+            return None, {
+                "trachea_branch": int(trachea_branch),
+                "parsed_branch_count": int(num_branches),
+                "candidate_count": 0,
+            }
+
+        branch_center = branch_coords.mean(axis=0)
+        candidates = [min(
+            node_by_id,
+            key=lambda node_id: float(np.linalg.norm(np.array(node_by_id[node_id]["zyx"]) - branch_center)),
+        )]
+
+    def score(node_id):
+        z, y, x = node_by_id[node_id]["zyx"]
+        center_distance = float(np.linalg.norm(np.array([y, x], dtype=np.float64) - center_yx))
+        if root_end == "min-z":
+            return (z, center_distance)
+        if root_end == "max-z":
+            return (-z, center_distance)
+        raise ValueError(f"Unsupported trachea root end: {root_end}")
+
+    root_id = min(candidates, key=score)
+    return root_id, {
+        "trachea_branch": int(trachea_branch),
+        "parsed_branch_count": int(num_branches),
+        "candidate_count": int(len(candidates)),
+        "used_endpoint_candidates": bool(endpoint_candidates),
+        "trachea_root_end": root_end,
+    }
+
+
+def choose_root(graph, mode, manual_root=None, radius_map=None, mask=None, skeleton=None, trachea_root_end="min-z"):
     if not graph["nodes"]:
         raise RuntimeError("Cannot choose root from an empty graph.")
 
@@ -286,12 +389,31 @@ def choose_root(graph, mode, manual_root=None):
         return min(
             node_by_id,
             key=lambda node_id: float(np.linalg.norm(np.array(node_by_id[node_id]["zyx"]) - target)),
+        ), {"manual_root_zyx": [int(v) for v in manual_root]}
+
+    if mode == "timi-trachea":
+        if mask is None or skeleton is None:
+            raise ValueError("timi-trachea root mode requires mask and skeleton.")
+        root_id, root_info = choose_timi_trachea_root(
+            graph,
+            mask=mask,
+            skeleton=skeleton,
+            root_end=trachea_root_end,
         )
+        if root_id is not None:
+            return root_id, root_info
+        print("[WARN] TIMI trachea root detection failed; falling back to center-min-z.")
+        mode = "center-min-z"
 
     def endpoint_score(node_id):
         z, y, x = node_by_id[node_id]["zyx"]
         center_distance = float(np.linalg.norm(np.array([y, x], dtype=np.float64) - center_yx))
 
+        if mode == "largest-radius":
+            if radius_map is None:
+                raise ValueError("largest-radius root mode requires a radius map.")
+            radius = float(radius_map[z, y, x])
+            return (-radius, center_distance)
         if mode == "min-z":
             return (z, center_distance)
         if mode == "max-z":
@@ -303,7 +425,7 @@ def choose_root(graph, mode, manual_root=None):
 
         raise ValueError(f"Unsupported root mode: {mode}")
 
-    return min(candidates, key=endpoint_score)
+    return min(candidates, key=endpoint_score), {}
 
 
 def dijkstra(adjacency, start):
@@ -406,9 +528,15 @@ def main():
     parser.add_argument("--prune-length", type=float, default=8.0, help="Remove terminal branches shorter than this voxel length")
     parser.add_argument(
         "--root-mode",
-        choices=["min-z", "max-z", "center-min-z", "center-max-z"],
+        choices=["min-z", "max-z", "center-min-z", "center-max-z", "largest-radius", "timi-trachea"],
         default="center-min-z",
         help="Automatic root selection heuristic",
+    )
+    parser.add_argument(
+        "--trachea-root-end",
+        choices=["min-z", "max-z"],
+        default="min-z",
+        help="Which end of the parsed trachea branch to use as root for timi-trachea mode",
     )
     parser.add_argument("--root-zyx", type=parse_zyx, default=None, help="Manual root coordinate as z,y,x")
     parser.add_argument("--target-node", type=int, default=None, help="Plan to a specific graph node id")
@@ -438,9 +566,18 @@ def main():
     graph = build_voxel_graph(skeleton)
     pruned_graph, pruned_branches = prune_short_terminal_branches(graph, args.prune_length)
     pruned_skeleton = graph_to_skeleton(pruned_graph, skeleton.shape)
+    radius_map = ndi.distance_transform_edt(mask)
 
     if pruned_graph["nodes"]:
-        root_id = choose_root(pruned_graph, mode=args.root_mode, manual_root=args.root_zyx)
+        root_id, root_info = choose_root(
+            pruned_graph,
+            mode=args.root_mode,
+            manual_root=args.root_zyx,
+            radius_map=radius_map,
+            mask=mask,
+            skeleton=pruned_skeleton,
+            trachea_root_end=args.trachea_root_end,
+        )
         adjacency = build_adjacency(pruned_graph)
         distances, previous = dijkstra(adjacency, root_id)
         target_nodes = choose_target_nodes(
@@ -459,6 +596,7 @@ def main():
             paths.append(path_to_record(f"path_{index:03d}", node_path, pruned_graph, root_id, distances))
     else:
         root_id = None
+        root_info = {}
         paths = []
 
     stem = input_path.name
@@ -509,6 +647,7 @@ def main():
                 if root_id is not None and root_id < len(pruned_graph["nodes"])
                 else None
             ),
+            "root_info": root_info,
             "removed_terminal_branches": pruned_branches,
             "graph": pruned_graph,
         }, f, indent=2)
@@ -518,6 +657,7 @@ def main():
             "input": str(input_path),
             "root_node": int(root_id) if root_id is not None else None,
             "root_mode": args.root_mode,
+            "root_info": root_info,
             "target_mode": args.target_mode,
             "path_count": len(paths),
             "paths": paths,
