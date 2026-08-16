@@ -19,7 +19,7 @@ def parse_tuple(value):
     return values
 
 
-def load_lumen_mask(mask_path, threshold=0.5):
+def load_lumen_mask(mask_path, threshold=0.5, low_threshold=None):
     arr = np.load(mask_path)
 
     if arr.ndim == 5:
@@ -29,7 +29,22 @@ def load_lumen_mask(mask_path, threshold=0.5):
     elif arr.ndim != 3:
         raise ValueError(f"Expected 3D, 4D, or 5D mask/probability array, got {arr.shape}")
 
-    mask = arr > threshold
+    if low_threshold is not None:
+        if low_threshold >= threshold:
+            raise ValueError("--low-threshold must be lower than --threshold")
+
+        seed = arr > threshold
+        weak = arr > low_threshold
+        if int(seed.sum()) == 0:
+            raise ValueError("Mask is empty after high thresholding. Recheck inference output or threshold.")
+
+        labeled, count = ndi.label(weak, structure=ndi.generate_binary_structure(3, 1))
+        seed_labels = np.unique(labeled[seed])
+        seed_labels = seed_labels[seed_labels != 0]
+        mask = np.isin(labeled, seed_labels) if count > 0 else seed
+    else:
+        mask = arr > threshold
+
     if int(mask.sum()) == 0:
         raise ValueError("Mask is empty after thresholding. Recheck inference output or threshold.")
 
@@ -103,6 +118,47 @@ def load_path_coordinates(paths_json, path_id=None):
     return path, coords_zyx
 
 
+def load_graph_coordinates(graph_json, min_generation=None, max_generation=None):
+    if graph_json is None:
+        return None, None, None
+
+    with open(graph_json, "r") as f:
+        payload = json.load(f)
+
+    graph = payload.get("graph", payload)
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not nodes or not edges:
+        raise ValueError("Graph JSON does not contain valid nodes/edges.")
+
+    node_by_id = {int(node["id"]): node for node in nodes}
+    kept_ids = set()
+    generations = {}
+
+    for node_id, node in node_by_id.items():
+        generation = node.get("generation")
+        generations[node_id] = generation
+        if min_generation is not None and generation is not None and generation < min_generation:
+            continue
+        if max_generation is not None and generation is not None and generation > max_generation:
+            continue
+        kept_ids.add(node_id)
+
+    ordered_ids = sorted(kept_ids)
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(ordered_ids)}
+    coords_zyx = np.asarray([node_by_id[node_id]["zyx"] for node_id in ordered_ids], dtype=np.float32)
+    filtered_edges = [
+        [old_to_new[int(a)], old_to_new[int(b)]]
+        for a, b in edges
+        if int(a) in kept_ids and int(b) in kept_ids
+    ]
+
+    if len(coords_zyx) == 0 or len(filtered_edges) == 0:
+        raise ValueError("No graph nodes/edges remained after generation filtering.")
+
+    return coords_zyx, filtered_edges, generations
+
+
 def zyx_to_xyz(coords_zyx, spacing_zyx=(1.0, 1.0, 1.0)):
     spacing = np.asarray(spacing_zyx, dtype=np.float32)
     coords_scaled = coords_zyx * spacing
@@ -143,6 +199,19 @@ def make_path_polyline(path_xyz):
     return line
 
 
+def make_graph_polyline(graph_xyz, graph_edges):
+    line = pv.PolyData(graph_xyz)
+    line.lines = np.asarray(
+        [
+            item
+            for edge in graph_edges
+            for item in (2, int(edge[0]), int(edge[1]))
+        ],
+        dtype=np.int64,
+    )
+    return line
+
+
 def save_obj(polydata, output_path):
     faces = polydata.faces.reshape((-1, 4))[:, 1:]
     points = polydata.points
@@ -168,6 +237,10 @@ def try_start_xvfb(enabled=True):
 def make_scene(
     surface,
     path_xyz,
+    graph_xyz=None,
+    graph_edges=None,
+    graph_tube_radius=0.35,
+    graph_color="#1d4ed8",
     tube_radius=1.5,
     endpoint_point_size=16,
     window_size=(1400, 1000),
@@ -178,6 +251,10 @@ def make_scene(
     plotter = pv.Plotter(off_screen=True, window_size=window_size)
     plotter.set_background("white")
     plotter.add_mesh(surface, color="#8ecae6", opacity=0.22, smooth_shading=True)
+    if graph_xyz is not None and graph_edges is not None:
+        graph_line = make_graph_polyline(graph_xyz, graph_edges)
+        graph_tube = graph_line.tube(radius=graph_tube_radius)
+        plotter.add_mesh(graph_tube, color=graph_color, opacity=0.7, smooth_shading=True)
     plotter.add_mesh(path_tube, color="red", smooth_shading=True)
     if endpoint_point_size > 0:
         plotter.add_points(
@@ -200,6 +277,10 @@ def render_overlay(
     surface,
     path_xyz,
     output_png,
+    graph_xyz=None,
+    graph_edges=None,
+    graph_tube_radius=0.35,
+    graph_color="#1d4ed8",
     tube_radius=1.5,
     endpoint_point_size=16,
     window_size=(1400, 1000),
@@ -207,6 +288,10 @@ def render_overlay(
     plotter = make_scene(
         surface,
         path_xyz,
+        graph_xyz=graph_xyz,
+        graph_edges=graph_edges,
+        graph_tube_radius=graph_tube_radius,
+        graph_color=graph_color,
         tube_radius=tube_radius,
         endpoint_point_size=endpoint_point_size,
         window_size=window_size,
@@ -219,6 +304,10 @@ def render_spin_gif(
     surface,
     path_xyz,
     output_gif,
+    graph_xyz=None,
+    graph_edges=None,
+    graph_tube_radius=0.35,
+    graph_color="#1d4ed8",
     tube_radius=1.5,
     endpoint_point_size=16,
     frames=72,
@@ -227,6 +316,10 @@ def render_spin_gif(
     plotter = make_scene(
         surface,
         path_xyz,
+        graph_xyz=graph_xyz,
+        graph_edges=graph_edges,
+        graph_tube_radius=graph_tube_radius,
+        graph_color=graph_color,
         tube_radius=tube_radius,
         endpoint_point_size=endpoint_point_size,
         window_size=window_size,
@@ -246,10 +339,22 @@ def main():
     )
     parser.add_argument("--mask", required=True, help="Predicted lumen mask/probability .npy")
     parser.add_argument("--paths-json", required=True, help="Path JSON from skeletonize_airrc_case.py")
+    parser.add_argument("--graph-json", default=None, help="Optional pruned centerline graph JSON to overlay full skeleton")
     parser.add_argument("--output-dir", required=True, help="Folder for STL/OBJ/PNG outputs")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold if --mask is a probability volume")
+    parser.add_argument(
+        "--low-threshold",
+        type=float,
+        default=None,
+        help="Optional lower connected threshold for faint distal airway mesh voxels",
+    )
     parser.add_argument("--path-id", default=None, help="Specific path_id to visualize; defaults to first path")
     parser.add_argument("--spacing", type=parse_tuple, default=(1.0, 1.0, 1.0), help="Voxel spacing as z,y,x")
+    parser.add_argument("--show-centerline-graph", action="store_true", help="Overlay the full pruned skeleton graph")
+    parser.add_argument("--min-graph-generation", type=int, default=None, help="Minimum graph generation to render")
+    parser.add_argument("--max-graph-generation", type=int, default=None, help="Maximum graph generation to render")
+    parser.add_argument("--graph-tube-radius", type=float, default=0.35, help="Radius of rendered skeleton graph tubes")
+    parser.add_argument("--graph-color", default="#1d4ed8", help="Color of the rendered skeleton graph")
     parser.add_argument("--mesh-keep-largest", action="store_true", help="Keep largest connected mask component for mesh")
     parser.add_argument("--mesh-fill-holes", action="store_true", help="Fill holes in mesh mask before surface extraction")
     parser.add_argument("--mesh-closing-radius", type=int, default=0, help="Binary closing iterations for mesh mask")
@@ -260,7 +365,7 @@ def main():
     parser.add_argument(
         "--endpoint-point-size",
         type=float,
-        default=16.0,
+        default=6.0,
         help="Rendered start/target marker size; use 0 to hide markers",
     )
     parser.add_argument("--make-video", action="store_true", help="Also save a rotating GIF validation video")
@@ -272,10 +377,11 @@ def main():
 
     mask_path = Path(args.mask)
     paths_json = Path(args.paths_json)
+    graph_json = Path(args.graph_json) if args.graph_json is not None else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mask = load_lumen_mask(mask_path, threshold=args.threshold)
+    mask = load_lumen_mask(mask_path, threshold=args.threshold, low_threshold=args.low_threshold)
     raw_mask_voxels = int(mask.sum())
     mask = postprocess_mesh_mask(
         mask,
@@ -286,6 +392,18 @@ def main():
     )
     path_record, path_zyx = load_path_coordinates(paths_json, path_id=args.path_id)
     path_xyz = zyx_to_xyz(path_zyx, spacing_zyx=args.spacing)
+    graph_xyz = None
+    graph_edges = None
+    graph_generations = None
+    if args.show_centerline_graph:
+        if graph_json is None:
+            raise ValueError("--show-centerline-graph requires --graph-json")
+        graph_zyx, graph_edges, graph_generations = load_graph_coordinates(
+            graph_json,
+            min_generation=args.min_graph_generation,
+            max_generation=args.max_graph_generation,
+        )
+        graph_xyz = zyx_to_xyz(graph_zyx, spacing_zyx=args.spacing)
     surface = mask_to_pyvista_surface(mask, spacing_zyx=args.spacing)
     surface = smooth_surface(
         surface,
@@ -305,6 +423,10 @@ def main():
         surface,
         path_xyz,
         overlay_png,
+        graph_xyz=graph_xyz,
+        graph_edges=graph_edges,
+        graph_tube_radius=args.graph_tube_radius,
+        graph_color=args.graph_color,
         tube_radius=args.tube_radius,
         endpoint_point_size=args.endpoint_point_size,
     )
@@ -313,6 +435,10 @@ def main():
             surface,
             path_xyz,
             overlay_gif,
+            graph_xyz=graph_xyz,
+            graph_edges=graph_edges,
+            graph_tube_radius=args.graph_tube_radius,
+            graph_color=args.graph_color,
             tube_radius=args.tube_radius,
             endpoint_point_size=args.endpoint_point_size,
             frames=args.video_frames,
@@ -321,6 +447,7 @@ def main():
     summary = {
         "mask": str(mask_path),
         "paths_json": str(paths_json),
+        "graph_json": str(graph_json) if graph_json is not None else None,
         "path_id": path_record.get("path_id"),
         "path_length_voxels": path_record.get("length_voxels"),
         "spacing_zyx": list(args.spacing),
@@ -338,6 +465,20 @@ def main():
         "surface_points": int(surface.n_points),
         "surface_cells": int(surface.n_cells),
         "path_points": int(len(path_xyz)),
+        "centerline_graph": {
+            "shown": bool(args.show_centerline_graph),
+            "points": int(len(graph_xyz)) if graph_xyz is not None else 0,
+            "edges": int(len(graph_edges)) if graph_edges is not None else 0,
+            "min_generation": args.min_graph_generation,
+            "max_generation": args.max_graph_generation,
+            "max_available_generation": (
+                int(max(value for value in graph_generations.values() if value is not None))
+                if graph_generations
+                else None
+            ),
+            "tube_radius": float(args.graph_tube_radius),
+            "color": args.graph_color,
+        },
         "tube_radius": float(args.tube_radius),
         "endpoint_point_size": float(args.endpoint_point_size),
         "stl": str(stl_path),
@@ -352,6 +493,8 @@ def main():
     print("Done")
     print("  mask:", mask_path)
     print("  paths json:", paths_json)
+    if graph_json is not None:
+        print("  graph json:", graph_json)
     print("  path id:", path_record.get("path_id"))
     print("  mask shape:", mask.shape)
     print("  raw mask voxels:", raw_mask_voxels)
@@ -363,6 +506,14 @@ def main():
     print("  surface points:", surface.n_points)
     print("  surface cells:", surface.n_cells)
     print("  path points:", len(path_xyz))
+    if args.show_centerline_graph:
+        print("  centerline graph points:", len(graph_xyz))
+        print("  centerline graph edges:", len(graph_edges))
+        if graph_generations:
+            print(
+                "  centerline graph max generation:",
+                max(value for value in graph_generations.values() if value is not None),
+            )
     print("  path length voxels:", path_record.get("length_voxels"))
     print("  STL:", stl_path)
     print("  OBJ:", obj_path)
