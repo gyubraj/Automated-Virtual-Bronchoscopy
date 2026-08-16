@@ -91,6 +91,25 @@ def keep_largest_component(mask):
     return labeled == largest_label
 
 
+def hysteresis_lumen_mask(volume, high_threshold, low_threshold=None):
+    high_mask = volume > high_threshold
+    if low_threshold is None or low_threshold >= high_threshold:
+        return high_mask
+
+    low_mask = volume > low_threshold
+    structure = ndi.generate_binary_structure(rank=3, connectivity=1)
+    labeled, count = ndi.label(low_mask, structure=structure)
+    if count == 0:
+        return high_mask
+
+    seed_labels = np.unique(labeled[high_mask])
+    seed_labels = seed_labels[seed_labels > 0]
+    if len(seed_labels) == 0:
+        return high_mask
+
+    return np.isin(labeled, seed_labels)
+
+
 def postprocess_mask(mask, keep_largest=True, closing_radius=1):
     mask = mask.astype(bool)
 
@@ -163,6 +182,21 @@ def build_adjacency(graph):
     return adjacency
 
 
+def build_active_adjacency(active_nodes, coords, edges):
+    adjacency = {node_id: [] for node_id in active_nodes}
+
+    for a, b in edges:
+        if a not in active_nodes or b not in active_nodes:
+            continue
+        za, ya, xa = coords[a]
+        zb, yb, xb = coords[b]
+        weight = math.sqrt((za - zb) ** 2 + (ya - yb) ** 2 + (xa - xb) ** 2)
+        adjacency[a].append((b, weight))
+        adjacency[b].append((a, weight))
+
+    return adjacency
+
+
 def trace_terminal_branch(endpoint, adjacency):
     path = [endpoint]
     previous = None
@@ -185,17 +219,20 @@ def trace_terminal_branch(endpoint, adjacency):
         length += weight
 
 
-def prune_short_terminal_branches(graph, min_branch_length):
+def prune_short_terminal_branches(graph, min_branch_length, protected_node_ids=None):
     if min_branch_length <= 0:
         return graph, []
 
-    current_graph = graph
+    protected_node_ids = set() if protected_node_ids is None else set(protected_node_ids)
+    active_nodes = {node["id"] for node in graph["nodes"]}
+    coords = {node["id"]: node["zyx"] for node in graph["nodes"]}
+    edges = [tuple(edge) for edge in graph["edges"]]
     removed = []
 
     changed = True
     while changed:
         changed = False
-        adjacency = build_adjacency(current_graph)
+        adjacency = build_active_adjacency(active_nodes, coords, edges)
         endpoints = [node_id for node_id, neighbors in adjacency.items() if len(neighbors) == 1]
 
         for endpoint in endpoints:
@@ -211,9 +248,11 @@ def prune_short_terminal_branches(graph, min_branch_length):
 
             if not to_remove:
                 continue
+            if protected_node_ids.intersection(to_remove):
+                continue
 
             for node_id in to_remove:
-                adjacency.pop(node_id, None)
+                active_nodes.discard(node_id)
 
             removed.append({
                 "endpoint": int(endpoint),
@@ -224,13 +263,7 @@ def prune_short_terminal_branches(graph, min_branch_length):
             changed = True
             break
 
-        if changed:
-            active_nodes = set(adjacency)
-            coords = {node["id"]: node["zyx"] for node in current_graph["nodes"]}
-            edges = [tuple(edge) for edge in current_graph["edges"]]
-            current_graph = graph_from_active_nodes(active_nodes, coords, edges)
-
-    return current_graph, removed
+    return graph_from_active_nodes(active_nodes, coords, edges), removed
 
 
 def graph_from_active_nodes(active_nodes, coords, edges):
@@ -452,6 +485,28 @@ def dijkstra(adjacency, start):
     return distances, previous
 
 
+def assign_airway_generations(graph, root_id):
+    adjacency = build_adjacency(graph)
+    node_by_id = {node["id"]: node for node in graph["nodes"]}
+    generations = {node_id: None for node_id in adjacency}
+    generations[root_id] = 0
+    queue = [(root_id, None)]
+
+    while queue:
+        current, previous = queue.pop(0)
+        current_generation = generations[current]
+
+        for neighbor, _ in adjacency[current]:
+            if neighbor == previous or generations[neighbor] is not None:
+                continue
+
+            increment = 1 if int(node_by_id[current].get("degree", 0)) >= 3 else 0
+            generations[neighbor] = int(current_generation + increment)
+            queue.append((neighbor, current))
+
+    return generations
+
+
 def reconstruct_path(previous, start, target):
     if target == start:
         return [start]
@@ -469,7 +524,16 @@ def reconstruct_path(previous, start, target):
     return []
 
 
-def choose_target_nodes(graph, root_id, distances, target_node=None, target_zyx=None, mode="farthest-endpoint"):
+def choose_target_nodes(
+    graph,
+    root_id,
+    distances,
+    target_node=None,
+    target_zyx=None,
+    mode="farthest-endpoint",
+    generations=None,
+    target_generation=6,
+):
     node_by_id = {node["id"]: node for node in graph["nodes"]}
 
     if target_node is not None:
@@ -498,21 +562,98 @@ def choose_target_nodes(graph, root_id, distances, target_node=None, target_zyx=
     if mode == "farthest-endpoint":
         return [max(reachable, key=lambda node_id: distances[node_id])] if reachable else []
 
+    if mode == "generation":
+        if generations is None:
+            raise ValueError("generation target mode requires computed airway generations.")
+
+        reachable_by_generation = [
+            node_id
+            for node_id in reachable
+            if generations.get(node_id) is not None
+        ]
+        if not reachable_by_generation:
+            return []
+
+        at_or_beyond_target = [
+            node_id
+            for node_id in reachable_by_generation
+            if generations[node_id] >= target_generation
+        ]
+        if at_or_beyond_target:
+            selected_generation = min(generations[node_id] for node_id in at_or_beyond_target)
+            candidates = [
+                node_id
+                for node_id in at_or_beyond_target
+                if generations[node_id] == selected_generation
+            ]
+            return [max(candidates, key=lambda node_id: distances[node_id])]
+
+        deepest_generation = max(generations[node_id] for node_id in reachable_by_generation)
+        candidates = [
+            node_id
+            for node_id in reachable_by_generation
+            if generations[node_id] == deepest_generation
+        ]
+        print(
+            "[WARN] No endpoint reached target generation "
+            f"{target_generation}; using deepest available generation {deepest_generation}."
+        )
+        return [max(candidates, key=lambda node_id: distances[node_id])]
+
     raise ValueError(f"Unsupported target mode: {mode}")
 
 
-def path_to_record(path_id, path_nodes, graph, root_id, distances):
+def path_to_record(
+    path_id,
+    path_nodes,
+    graph,
+    root_id,
+    distances,
+    generations=None,
+    requested_target_zyx=None,
+    effective_target_mode=None,
+):
     node_by_id = {node["id"]: node for node in graph["nodes"]}
     target_id = path_nodes[-1] if path_nodes else None
+    selected_target_zyx = node_by_id[target_id]["zyx"] if target_id is not None else None
+    path_generations = [
+        generations.get(node_id)
+        for node_id in path_nodes
+        if generations is not None and generations.get(node_id) is not None
+    ]
 
-    return {
+    record = {
         "path_id": path_id,
         "root_node": int(root_id),
         "target_node": int(target_id) if target_id is not None else None,
+        "selected_target_node": int(target_id) if target_id is not None else None,
+        "selected_target_zyx": selected_target_zyx,
         "length_voxels": float(distances[target_id]) if target_id is not None else 0.0,
         "node_ids": [int(node_id) for node_id in path_nodes],
         "coordinates_zyx": [node_by_id[node_id]["zyx"] for node_id in path_nodes],
     }
+    if effective_target_mode is not None:
+        record["effective_target_mode"] = effective_target_mode
+    if requested_target_zyx is not None:
+        requested = [int(value) for value in requested_target_zyx]
+        record["requested_target_zyx"] = requested
+        record["target_distance_voxels"] = (
+            float(np.linalg.norm(np.asarray(selected_target_zyx, dtype=np.float64) - np.asarray(requested, dtype=np.float64)))
+            if selected_target_zyx is not None
+            else None
+        )
+    if generations is not None:
+        record["target_generation"] = (
+            int(generations[target_id])
+            if target_id is not None and generations.get(target_id) is not None
+            else None
+        )
+        record["max_generation"] = int(max(path_generations)) if path_generations else None
+        record["node_generations"] = [
+            int(generations[node_id]) if generations.get(node_id) is not None else None
+            for node_id in path_nodes
+        ]
+    return record
 
 
 def main():
@@ -522,14 +663,29 @@ def main():
     parser.add_argument("--input", required=True, help="Predicted lumen mask/probability volume: .npy, .nii, or .nii.gz")
     parser.add_argument("--output-dir", default="datasets/centerlines", help="Output folder")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for probability volumes")
+    parser.add_argument(
+        "--low-threshold",
+        type=float,
+        default=None,
+        help="Optional lower connected threshold for weak distal airway extraction",
+    )
     parser.add_argument("--channel", type=int, default=0, help="Channel to read if input has channels")
     parser.add_argument("--keep-largest", action="store_true", help="Keep only largest connected component")
     parser.add_argument("--closing-radius", type=int, default=1, help="Binary closing iterations before skeletonization")
     parser.add_argument("--prune-length", type=float, default=8.0, help="Remove terminal branches shorter than this voxel length")
     parser.add_argument(
+        "--preserve-generations",
+        type=int,
+        default=6,
+        help=(
+            "Protect skeleton graph nodes up to this airway generation from terminal-branch pruning; "
+            "use 0 to disable generation-aware preservation"
+        ),
+    )
+    parser.add_argument(
         "--root-mode",
         choices=["min-z", "max-z", "center-min-z", "center-max-z", "largest-radius", "timi-trachea"],
-        default="center-min-z",
+        default="timi-trachea",
         help="Automatic root selection heuristic",
     )
     parser.add_argument(
@@ -543,9 +699,15 @@ def main():
     parser.add_argument("--target-zyx", type=parse_zyx, default=None, help="Plan to nearest node to z,y,x")
     parser.add_argument(
         "--target-mode",
-        choices=["farthest-endpoint", "all-endpoints"],
+        choices=["farthest-endpoint", "all-endpoints", "generation"],
         default="farthest-endpoint",
         help="Target endpoint selection when no explicit target is given",
+    )
+    parser.add_argument(
+        "--target-generation",
+        type=int,
+        default=6,
+        help="Airway generation target when --target-mode generation",
     )
     args = parser.parse_args()
 
@@ -555,7 +717,7 @@ def main():
 
     volume, reference_img = load_volume(input_path, channel=args.channel)
 
-    mask = volume > args.threshold
+    mask = hysteresis_lumen_mask(volume, args.threshold, low_threshold=args.low_threshold)
     mask = postprocess_mask(
         mask,
         keep_largest=args.keep_largest,
@@ -564,9 +726,43 @@ def main():
 
     skeleton = skeletonize_lumen(mask)
     graph = build_voxel_graph(skeleton)
-    pruned_graph, pruned_branches = prune_short_terminal_branches(graph, args.prune_length)
-    pruned_skeleton = graph_to_skeleton(pruned_graph, skeleton.shape)
     radius_map = ndi.distance_transform_edt(mask)
+    protected_node_ids = set()
+    pre_prune_root_info = {}
+
+    if graph["nodes"] and args.preserve_generations > 0:
+        try:
+            pre_prune_root_id, pre_prune_root_info = choose_root(
+                graph,
+                mode=args.root_mode,
+                manual_root=args.root_zyx,
+                radius_map=radius_map,
+                mask=mask,
+                skeleton=skeleton,
+                trachea_root_end=args.trachea_root_end,
+            )
+            pre_prune_generations = assign_airway_generations(graph, pre_prune_root_id)
+            protected_node_ids = {
+                node_id
+                for node_id, generation in pre_prune_generations.items()
+                if generation is not None and generation <= args.preserve_generations
+            }
+        except Exception as exc:
+            print("[WARN] Generation-aware branch preservation failed:", exc)
+            protected_node_ids = set()
+
+    pruned_graph, pruned_branches = prune_short_terminal_branches(
+        graph,
+        args.prune_length,
+        protected_node_ids=protected_node_ids,
+    )
+    pruned_skeleton = graph_to_skeleton(pruned_graph, skeleton.shape)
+
+    effective_target_mode = args.target_mode
+    if args.target_node is not None:
+        effective_target_mode = "target-node"
+    elif args.target_zyx is not None:
+        effective_target_mode = "target-zyx"
 
     if pruned_graph["nodes"]:
         root_id, root_info = choose_root(
@@ -580,6 +776,10 @@ def main():
         )
         adjacency = build_adjacency(pruned_graph)
         distances, previous = dijkstra(adjacency, root_id)
+        generations = assign_airway_generations(pruned_graph, root_id)
+        for node in pruned_graph["nodes"]:
+            generation = generations.get(node["id"])
+            node["generation"] = int(generation) if generation is not None else None
         target_nodes = choose_target_nodes(
             graph=pruned_graph,
             root_id=root_id,
@@ -587,16 +787,30 @@ def main():
             target_node=args.target_node,
             target_zyx=args.target_zyx,
             mode=args.target_mode,
+            generations=generations,
+            target_generation=args.target_generation,
         )
         paths = []
         for index, target_id in enumerate(target_nodes):
             node_path = reconstruct_path(previous, root_id, target_id)
             if not node_path:
                 continue
-            paths.append(path_to_record(f"path_{index:03d}", node_path, pruned_graph, root_id, distances))
+            paths.append(
+                path_to_record(
+                    f"path_{index:03d}",
+                    node_path,
+                    pruned_graph,
+                    root_id,
+                    distances,
+                    generations=generations,
+                    requested_target_zyx=args.target_zyx,
+                    effective_target_mode=effective_target_mode,
+                )
+            )
     else:
         root_id = None
         root_info = {}
+        generations = {}
         paths = []
 
     stem = input_path.name
@@ -620,6 +834,7 @@ def main():
         json.dump({
             "input": str(input_path),
             "threshold": args.threshold,
+            "low_threshold": args.low_threshold,
             "channel": args.channel,
             "skeleton_voxels": int(skeleton.sum()),
             "node_count": len(graph["nodes"]),
@@ -633,6 +848,7 @@ def main():
         json.dump({
             "input": str(input_path),
             "threshold": args.threshold,
+            "low_threshold": args.low_threshold,
             "channel": args.channel,
             "prune_length": args.prune_length,
             "skeleton_voxels": int(pruned_skeleton.sum()),
@@ -648,6 +864,15 @@ def main():
                 else None
             ),
             "root_info": root_info,
+            "generation_method": "branchpoint_count_from_root",
+            "max_generation": (
+                int(max(value for value in generations.values() if value is not None))
+                if generations
+                else 0
+            ),
+            "preserve_generations": int(args.preserve_generations),
+            "pre_prune_root_info": pre_prune_root_info,
+            "generation_protected_node_count": int(len(protected_node_ids)),
             "removed_terminal_branches": pruned_branches,
             "graph": pruned_graph,
         }, f, indent=2)
@@ -655,10 +880,18 @@ def main():
     with open(paths_json, "w") as f:
         json.dump({
             "input": str(input_path),
+            "threshold": args.threshold,
+            "low_threshold": args.low_threshold,
             "root_node": int(root_id) if root_id is not None else None,
             "root_mode": args.root_mode,
             "root_info": root_info,
-            "target_mode": args.target_mode,
+            "target_mode": effective_target_mode,
+            "effective_target_mode": effective_target_mode,
+            "fallback_target_mode": args.target_mode,
+            "requested_target_node": int(args.target_node) if args.target_node is not None else None,
+            "requested_target_zyx": [int(value) for value in args.target_zyx] if args.target_zyx is not None else None,
+            "target_generation": int(args.target_generation) if effective_target_mode == "generation" else None,
+            "preserve_generations": int(args.preserve_generations),
             "path_count": len(paths),
             "paths": paths,
         }, f, indent=2)
@@ -676,6 +909,8 @@ def main():
     print("  graph json:", graph_json)
     print("  pruned graph json:", pruned_graph_json)
     print("  paths json:", paths_json)
+    print("  threshold:", args.threshold)
+    print("  low threshold:", args.low_threshold)
     print("  skeleton voxels:", int(skeleton.sum()))
     print("  graph nodes:", len(graph["nodes"]))
     print("  graph edges:", len(graph["edges"]))
@@ -686,10 +921,16 @@ def main():
     print("  pruned graph edges:", len(pruned_graph["edges"]))
     print("  pruned endpoints:", len(pruned_graph["endpoints"]))
     print("  pruned branchpoints:", len(pruned_graph["branchpoints"]))
+    print("  preserve generations:", args.preserve_generations)
+    print("  generation protected nodes:", len(protected_node_ids))
     print("  root node:", root_id)
+    if generations:
+        print("  max generation:", max(value for value in generations.values() if value is not None))
     print("  planned paths:", len(paths))
     if paths:
         print("  first path length:", "%.2f" % paths[0]["length_voxels"])
+        if paths[0].get("target_generation") is not None:
+            print("  first path target generation:", paths[0]["target_generation"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+/home/opat90op/project/Automated-Virtual-Bronchoscopy/extract_airrc_patches.py:28: FutureWarning: `skeletonize_3d` is deprecated since version 0.23 and will be removed in version 0.25. Use `skimage.morphology.skeletonize` instead.
+  return sk_skeletonize_3d(lumen).astype(bool)
+[2026-07-28T09:28:05.023] error: *** JOB 1660241 ON ant2 CANCELLED AT 2026-07-28T09:28:05 DUE to SIGNAL Terminated ***
