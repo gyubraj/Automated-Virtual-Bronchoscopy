@@ -1,0 +1,30 @@
+{
+  "mesh": "/home/opat90op/AMS_Project/datasets_new/visualizations/LIDC-IDRI-0001_topology_clean_prune12_thr02_meshclean/airway_lumen_mesh.stl",
+  "paths_json": "/home/opat90op/AMS_Project/datasets_new/centerlines/LIDC-IDRI-0001_topology_clean_prune12_thr02/pred_lumen_smoothed_paths.json",
+  "path_id": "path_000_smooth",
+  "output": "/home/opat90op/AMS_Project/datasets_new/visualizations/LIDC-IDRI-0001_topology_clean_prune12_thr02_meshclean/airway_flythrough_better.gif",
+  "frames": 240,
+  "fps": 24,
+  "duration_seconds": 10.0,
+  "lookahead": 14,
+  "spacing_zyx": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "path_points": 226,
+  "start_zyx": [
+    328.0,
+    149.0,
+    163.0
+  ],
+  "end_zyx": [
+    220.0,
+    249.0,
+    216.0
+  ],
+  "mesh_smooth_iterations": 4,
+  "mucosa_texture": true,
+  "texture_strength": 0.85,
+  "view_angle": 92.0
+}
