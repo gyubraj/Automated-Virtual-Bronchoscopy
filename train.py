@@ -120,10 +120,10 @@ def train():
     weight_decay = 1e-4
 
     home = Path.home()
-    PROJECT_ROOT = home / "AMS_Project"
+    PROJECT_ROOT = home
 
-    train_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "train.json"
-    val_json = PROJECT_ROOT / "datasets_new" / "airrc_patches" / "splits" / "val.json"
+    train_json = PROJECT_ROOT / "ams_data" / "airrc_patches" / "splits" / "train.json"
+    val_json = PROJECT_ROOT / "ams_data" / "airrc_patches" / "splits" / "val.json"
     save_dir = Path("./saved_model")
     save_dir.mkdir(parents=True, exist_ok=True)
 
