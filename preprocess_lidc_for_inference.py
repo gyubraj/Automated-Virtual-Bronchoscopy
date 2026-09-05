@@ -17,7 +17,7 @@ def parse_spacing(value):
     return values
 
 
-def read_dicom_series(dicom_dir):
+def read_dicom_series(dicom_dir, series_uid=None):
     if sitk is None:
         raise RuntimeError("SimpleITK is required. Install it with: pip install SimpleITK")
 
@@ -29,18 +29,28 @@ def read_dicom_series(dicom_dir):
     series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
 
     if not series_ids:
+        if series_uid is not None:
+            raise RuntimeError("Cannot select --series-uid because no DICOM series IDs were found.")
         files = reader.GetGDCMSeriesFileNames(str(dicom_dir))
     else:
-        if len(series_ids) > 1:
-            print(f"[WARN] Found {len(series_ids)} DICOM series. Using first series id: {series_ids[0]}")
-        files = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
+        series_ids = list(series_ids)
+        if series_uid is None:
+            if len(series_ids) > 1:
+                raise RuntimeError(
+                    f"Found {len(series_ids)} DICOM series in {dicom_dir}. "
+                    "Pass --series-uid to choose the CT series explicitly."
+                )
+            series_uid = series_ids[0]
+        elif series_uid not in series_ids:
+            raise RuntimeError(f"Requested DICOM series UID not found in {dicom_dir}: {series_uid}")
+        files = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_uid)
 
     if not files:
         raise RuntimeError(f"No DICOM files found in {dicom_dir}")
 
     reader.SetFileNames(files)
     image = reader.Execute()
-    return image, files
+    return image, files, series_uid
 
 
 def resample_image(image, target_spacing_zyx, interpolator=sitk.sitkLinear):
@@ -77,10 +87,11 @@ def normalize_ct_hu(ct, clip_min=-1000.0, clip_max=400.0):
     return ct.astype(np.float32)
 
 
-def save_metadata(path, case_id, dicom_dir, dicom_files, original_image, resampled_image, target_spacing_zyx):
+def save_metadata(path, case_id, dicom_dir, dicom_files, original_image, resampled_image, target_spacing_zyx, series_uid):
     metadata = {
         "case_id": case_id,
         "dicom_dir": str(Path(dicom_dir)),
+        "selected_series_uid": series_uid,
         "num_dicom_files": len(dicom_files),
         "target_spacing_zyx": list(target_spacing_zyx),
         "original": {
@@ -112,6 +123,7 @@ def main():
         description="Preprocess a raw LIDC DICOM CT series for WingsNet airway inference."
     )
     parser.add_argument("--dicom-dir", required=True, help="Folder containing one CT DICOM series")
+    parser.add_argument("--series-uid", default=None, help="Required when --dicom-dir contains multiple series")
     parser.add_argument("--case-id", required=True, help="Case id used for output filenames")
     parser.add_argument("--output-root", required=True, help="Root folder containing images/ and metadata/")
     parser.add_argument("--target-spacing", type=parse_spacing, default=(1.0, 1.0, 1.0), help="Target spacing as z,y,x")
@@ -125,9 +137,10 @@ def main():
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
     print("Reading DICOM series:", args.dicom_dir)
-    image, dicom_files = read_dicom_series(args.dicom_dir)
+    image, dicom_files, series_uid = read_dicom_series(args.dicom_dir, series_uid=args.series_uid)
     original_arr = sitk.GetArrayFromImage(image)
     print("  original shape z,y,x:", original_arr.shape)
+    print("  selected series uid:", series_uid)
     print("  original spacing x,y,z:", image.GetSpacing())
     print("  original HU min/max/mean:", float(original_arr.min()), float(original_arr.max()), float(original_arr.mean()))
 
@@ -151,6 +164,7 @@ def main():
         original_image=image,
         resampled_image=resampled,
         target_spacing_zyx=args.target_spacing,
+        series_uid=series_uid,
     )
 
     print("Saved:")

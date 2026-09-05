@@ -8,10 +8,18 @@
 #SBATCH --output=wingsnet_%j.out
 #SBATCH --error=wingsnet_%j.err
 
-cd /home/opat90op/project/Automated-Virtual-Bronchoscopy
-source idc_env/bin/activate
+set -euo pipefail
 
-python train.py \
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
+ENV_ACTIVATE=${AVB_ENV_ACTIVATE:-$SCRIPT_DIR/idc_env/bin/activate}
+if [[ -f "$ENV_ACTIVATE" ]]; then
+  source "$ENV_ACTIVATE"
+fi
+
+PYTHON_BIN=${AVB_PYTHON:-python}
+"$PYTHON_BIN" -u train.py \
   --resume saved_model/wingsnet_best_checkpoint.pth \
   --fine-tune \
   --save-dir saved_model_topology \

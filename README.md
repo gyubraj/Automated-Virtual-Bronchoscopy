@@ -16,25 +16,289 @@ CT volume
 
 The current pipeline supports AirRC-style processed CT tensors and raw LIDC DICOM CT series.
 
-## Important Fixes Applied
+## Start Here
 
-Two fixes were needed before LIDC visualization became reasonable:
+This section is the complete setup and first-run path for a new user. Later sections document individual stages, training, validation, mesh export, and research interpretation.
 
-1. `infer_wingsnet_full_volume.py` now uses the final model output head for tuple/list outputs:
+### 1. Supported Environment
 
-```python
-output = output[-1]
-```
+The main pipeline is intended for Linux or a Linux-based Slurm cluster.
 
-This matches `evaluation.py` and avoids using an earlier deep-supervision head.
+Required:
 
-2. `skeletonize_airrc_case.py` now supports:
+- Python 3.10 or newer.
+- PyTorch 2.x.
+- The Python packages in `requirements.txt`.
+- A trained WingsNet checkpoint.
+- A CT DICOM series and, for POI navigation, its matching LIDC XML annotation.
+
+Recommended for practical full-volume inference:
+
+- An NVIDIA CUDA GPU with at least 16 GB memory.
+- 16-24 GB system memory.
+- Xvfb on headless Linux nodes for PyVista rendering.
+
+Blender is not required for segmentation, path planning, validation, or flythrough rendering. It is only required by `blender_make_hollow_airway_shell.py` when producing a hollow physical-printing shell.
+
+### 2. Create the Python Environment
+
+From the repository root:
 
 ```bash
---root-mode timi-trachea
+python3.10 -m venv idc_env
+source idc_env/bin/activate
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-This uses TIMI-style branch parsing to pick the trachea branch instead of choosing a root by simple endpoint geometry.
+Install the PyTorch build appropriate for the machine first. On a managed cluster, use the CUDA/PyTorch command recommended by the administrator. For a CPU-only installation:
+
+```bash
+python -m pip install torch
+```
+
+Then install the remaining dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` deliberately does not install PyTorch because replacing a cluster-specific CUDA wheel with a generic wheel can disable GPU access.
+
+Verify PyTorch before submitting a GPU job:
+
+```bash
+python -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.cuda.is_available()); print('torch cuda build:', torch.version.cuda)"
+```
+
+On a cluster, run this check inside an allocated GPU node. CUDA commonly reports `False` on a login node even when the environment is correct.
+
+### 3. Configure Project Data
+
+The default data location is:
+
+```text
+~/AMS_Project/datasets_new
+```
+
+To use another location, set one environment variable before running Python or submitting Slurm jobs:
+
+```bash
+export AVB_DATA_ROOT=/path/to/datasets_new
+```
+
+Create the expected base directories:
+
+```bash
+mkdir -p "$AVB_DATA_ROOT"/{airrc,airrc_patches,centerlines,final_validation,lidc,predictions,processed_airrc,processed_lidc,visualizations}
+```
+
+If `AVB_DATA_ROOT` is not set, replace it in this command with `$HOME/AMS_Project/datasets_new`.
+
+The pipeline creates case-specific prediction, centerline, and visualization directories automatically.
+
+### 4. Install the Required Checkpoint
+
+The final checkpoint expected by the documented LIDC workflow is:
+
+```text
+saved_model_topology/wingsnet_best.pth
+```
+
+Place it relative to the repository root:
+
+```bash
+mkdir -p saved_model_topology
+ls -lh saved_model_topology/wingsnet_best.pth
+```
+
+The `.pth` file is a required project artifact. If it is not distributed with the repository, obtain it from the project maintainer before running inference. Training data and source code alone do not recreate this exact checkpoint without retraining.
+
+The original comparison checkpoint, used by the ablation suite, is:
+
+```text
+saved_model/wingsnet_best.pth
+```
+
+### 5. Verify the Installation
+
+Run the automated setup check:
+
+```bash
+python check_setup.py \
+  --checkpoint saved_model_topology/wingsnet_best.pth \
+  --data-root "$AVB_DATA_ROOT"
+```
+
+For a GPU node:
+
+```bash
+python check_setup.py \
+  --checkpoint saved_model_topology/wingsnet_best.pth \
+  --data-root "$AVB_DATA_ROOT" \
+  --require-cuda
+```
+
+Run the focused tests:
+
+```bash
+python -m unittest tests/test_core_utils.py
+```
+
+Do not proceed until the setup check finds the checkpoint and all required dependencies.
+
+### 6. Download One LIDC Test Series
+
+The `idc` command is provided by the `idc-index` package included in `requirements.txt`. A specific CT series can be downloaded directly by `SeriesInstanceUID`:
+
+```bash
+SERIES_UID=1.3.6.1.4.1.14519.5.2.1.6279.6001.179049373636438705059720603192
+
+idc download "$SERIES_UID" \
+  --download-dir "$AVB_DATA_ROOT/lidc/idc_downloads"
+```
+
+The LIDC XML annotation collection must also be available. Download `LIDC-XML-only.zip` from the official TCIA LIDC-IDRI collection page and extract it under:
+
+```text
+$AVB_DATA_ROOT/lidc/lidc_idri/LIDC-XML-only/
+```
+
+Official resources:
+
+- IDC command-line download documentation: <https://github.com/ImagingDataCommons/idc-index>
+- TCIA LIDC-IDRI collection and XML annotations: <https://www.cancerimagingarchive.net/collection/lidc-idri/>
+
+The workflow verifies that the XML `SeriesInstanceUID` matches the selected DICOM series. It stops rather than silently converting coordinates from the wrong scan.
+
+### 7. Run the Complete LIDC Workflow
+
+On Slurm, one submission performs preprocessing, inference, graph extraction, POI ranking, target selection, path smoothing, target auditing, visualization, and optional flythrough rendering:
+
+```bash
+sbatch run_lidc_case_gpu.sh \
+  --case-id LIDC-IDRI-0011 \
+  --series-uid "$SERIES_UID" \
+  --dicom-root "$AVB_DATA_ROOT/lidc/idc_downloads" \
+  --xml-root "$AVB_DATA_ROOT/lidc/lidc_idri/LIDC-XML-only" \
+  --data-root "$AVB_DATA_ROOT" \
+  --checkpoint saved_model_topology/wingsnet_best.pth \
+  --make-video \
+  --make-flythrough
+```
+
+The Slurm file defaults to the project cluster's `gpu-stud` partition. On another cluster, override its resource settings when submitting or edit only the `#SBATCH` header. For example:
+
+```bash
+sbatch --partition=<gpu-partition> run_lidc_case_gpu.sh <the same arguments>
+```
+
+Without Slurm, run the same workflow directly from an activated environment:
+
+```bash
+python run_lidc_case.py \
+  --case-id LIDC-IDRI-0011 \
+  --series-uid "$SERIES_UID" \
+  --dicom-root "$AVB_DATA_ROOT/lidc/idc_downloads" \
+  --xml-root "$AVB_DATA_ROOT/lidc/lidc_idri/LIDC-XML-only" \
+  --data-root "$AVB_DATA_ROOT" \
+  --checkpoint saved_model_topology/wingsnet_best.pth \
+  --device cuda \
+  --amp \
+  --make-video \
+  --make-flythrough \
+  --no-xvfb
+```
+
+Omit `--no-xvfb` on a headless Linux machine that has Xvfb available. Use `--device cpu` only for functional testing; full-volume inference can be very slow on CPU.
+
+### 8. Monitor the Job
+
+The job ID is printed by `sbatch`.
+
+```bash
+squeue -j <JOBID>
+tail -f lidc_case_<JOBID>.out
+cat lidc_case_<JOBID>.err
+```
+
+Completion is indicated by:
+
+```text
+LIDC case workflow complete
+```
+
+A queued Slurm job is waiting for cluster resources; it is not stuck. A job that disappears from `squeue` can be checked with:
+
+```bash
+sacct -j <JOBID> --format=JobID,State,Elapsed,ExitCode,MaxRSS
+```
+
+### 9. Check the Outputs
+
+For the example above, the canonical outputs are:
+
+```text
+$AVB_DATA_ROOT/predictions/LIDC-IDRI-0011_topology_auto/
+$AVB_DATA_ROOT/centerlines/LIDC-IDRI-0011_topology_auto_thr02/
+$AVB_DATA_ROOT/visualizations/LIDC-IDRI-0011_topology_auto_thr02/
+```
+
+Important files:
+
+```text
+predictions/.../pred_lumen.npy
+centerlines/.../pred_lumen_centerline_pruned_graph.json
+centerlines/.../pred_lumen_paths.json
+centerlines/.../pred_lumen_smoothed_paths.json
+centerlines/.../all_poi_target_audit.csv
+centerlines/.../selected_target_audit.json
+visualizations/.../airway_mesh_path_overlay.png
+visualizations/.../airway_mesh_path_overlay.gif
+visualizations/.../airway_flythrough_bronchoscopy.gif
+visualizations/.../lidc_case_run_summary.json
+```
+
+The LIDC target is a nodule centroid, not an airway-centerline coordinate. The final navigation endpoint is therefore the closest recovered graph node and should remain inside the predicted lumen. `target_in_lumen: false` at the nodule center alone does not mean the planner failed; inspect the selected graph distance, local airway support, path occupancy, and overlay together.
+
+### 10. Three Supported Workflows
+
+Use the appropriate entry point rather than manually combining every script:
+
+| Goal | Entry point |
+|---|---|
+| Test one new LIDC case | `sbatch run_lidc_case_gpu.sh ...` |
+| Validate the final checkpoint on held-out AirRC | `sbatch final_validation_gpu.sh` |
+| Compare baseline/topology/postprocessing settings | `sbatch ablation_validation_gpu.sh` |
+| Rebuild AirRC patches | `sbatch extract_patches_gpu.sh` |
+| Fine-tune WingsNet | `sbatch train_gpu.sh` |
+
+The AirRC/ATM-style training data are governed by their original dataset terms and are not assumed to be bundled with this repository. Preserve the case-level train/validation split generated by `extract_airrc_patches.py`.
+
+### 11. Troubleshooting
+
+| Problem | Meaning and action |
+|---|---|
+| `torch.cuda.is_available() is False` | Run inside an allocated GPU node; then verify the installed PyTorch wheel matches the cluster CUDA runtime. |
+| `nvidia-smi: command not found` on login node | The login node may not expose a GPU. Request a GPU allocation or submit with `sbatch`. |
+| Slurm job remains `PENDING` | Inspect `squeue -j <JOBID> -o "%.18i %.2t %.10M %.30R"`; the final column explains the scheduling reason. |
+| Multiple DICOM series found | Pass the exact CT `--series-uid`. The one-command wrapper locates it recursively. |
+| XML series mismatch | Use the XML belonging to the same `SeriesInstanceUID`; do not bypass the check for normal experiments. |
+| Checkpoint missing/incompatible | Place the documented checkpoint correctly. Loading is strict by default to prevent partial-model inference. |
+| PyVista display/X server error | On a cluster install/use Xvfb. On a desktop session pass `--no-xvfb`. |
+| `blender: command not found` | Blender is optional and separate from the Python environment; install it only for printable-shell export. |
+| Output looks branched but misses the nodule region | Smoothing cannot create an absent airway. Inspect `all_poi_target_audit.csv` and the predicted lumen support near the POI. |
+| Rerunning repeats expensive inference | Add `--reuse-prediction` only when the processed CT, run ID, model architecture, and checkpoint are unchanged. |
+
+### 12. Reproducibility Notes
+
+- Coordinates are stored as voxel `z,y,x` unless a field explicitly says physical `x,y,z`.
+- Processed LIDC volumes use 1 mm isotropic spacing by default.
+- DICOM/XML series identity is checked before POI conversion.
+- Checkpoints load strictly unless `--allow-partial-checkpoint` is explicitly requested for controlled architecture migration.
+- LIDC XML supplies nodule annotations, not airway ground truth. LIDC results are qualitative target-navigation demonstrations.
+- Quantitative segmentation and branch-recall claims must come from held-out AirRC cases with airway labels.
+- The flythrough is a visualization of a planned centerline path, not proof of physical bronchoscope clearance or autonomous clinical safety.
+
 
 ## Main Scripts
 
@@ -81,6 +345,36 @@ validate_centerline_graph.py
 Computes graph/path validation metrics.
 
 ```text
+run_final_validation_suite.py
+```
+
+Runs the final pipeline on held-out AirRC validation cases and aggregates centerline/branch/path metrics into JSON and CSV. This is the main evidence that the checkpoint improves connected airway recovery beyond the single LIDC example.
+
+```text
+run_validation_ablation.py
+```
+
+Runs report-ready ablations comparing the baseline checkpoint, topology checkpoint, threshold choices, and pruning choices.
+
+```text
+summarize_validation_tables.py
+```
+
+Creates a Markdown/JSON results table from one or more validation summary CSV files.
+
+```text
+make_final_airway_report.py
+```
+
+Packages the final LIDC target audit, graph/path metrics, flythrough metrics, and mesh topology stats into one report. This is a reporting wrapper; it does not replace held-out validation.
+
+```text
+blender_make_hollow_airway_shell.py
+```
+
+Creates a printable hollow airway shell from the open lumen surface using Blender Solidify. Keep this separate from the navigation mesh: the open lumen mesh is for virtual bronchoscopy, while the hollow shell is for physical print testing.
+
+```text
 extract_lidc_poi_target.py
 ```
 
@@ -96,6 +390,14 @@ Runs inference, skeletonization/path planning, spline path smoothing, and visual
 
 For raw LIDC DICOM input, first preprocess the CT series.
 
+If the folder contains more than one DICOM series, pass the exact CT `SeriesInstanceUID`:
+
+```bash
+--series-uid 1.2.840....
+```
+
+The chosen UID is written into the metadata as `selected_series_uid`. The LIDC POI extraction script checks this against the XML `SeriesInstanceUID` before converting nodule coordinates.
+
 Example DICOM folder:
 
 ```bash
@@ -109,6 +411,7 @@ Run:
 ```bash
 python preprocess_lidc_for_inference.py \
   --dicom-dir ${CT_DIR} \
+  --series-uid <CT_SERIES_INSTANCE_UID> \
   --case-id ${CASE_ID} \
   --output-root /home/opat90op/AMS_Project/datasets_new/processed_lidc \
   --target-spacing 1,1,1 \
@@ -513,6 +816,86 @@ timi unreached branches low
 timi multi-parent branches low
 endpoint/branchpoint counts not exploding
 ```
+
+### Held-out AirRC Validation
+
+The LIDC nodule case checks target navigation, but it does not have airway ground truth. To judge whether the model really learned deeper connected airway branches, run the final checkpoint on held-out AirRC cases:
+
+```bash
+python run_final_validation_suite.py \
+  --data-root /home/opat90op/AMS_Project/datasets_new \
+  --checkpoint saved_model_topology/wingsnet_best.pth \
+  --device cuda \
+  --limit 51 \
+  --mask-threshold 0.2 \
+  --skeleton-threshold 0.2 \
+  --skeleton-low-threshold 0.08 \
+  --prune-length 12 \
+  --preserve-generations 8 \
+  --output-root /home/opat90op/AMS_Project/datasets_new/final_validation/airrc
+```
+
+Outputs:
+
+```text
+/home/opat90op/AMS_Project/datasets_new/final_validation/airrc/final_validation_summary.json
+/home/opat90op/AMS_Project/datasets_new/final_validation/airrc/final_validation_summary.csv
+```
+
+Important fields:
+
+```text
+gt_branch_recall_3vox_80pct
+gt_branch_recall_gen6
+gt_branch_recall_gen7
+gt_branch_recall_gen8
+gt_centerline_coverage_1vox
+gt_centerline_coverage_2vox
+gt_centerline_coverage_3vox
+gt_centerline_coverage_5vox
+pred_centerline_precision_2vox
+gt_symmetric_mean_distance
+gt_length_ratio_pred_over_gt
+lumen_dice
+lumen_precision
+lumen_recall
+timi_max_generation
+timi_unreached_branches
+endpoints
+branchpoints
+short_terminal_branches
+first_path_inside_lumen_ratio
+mean_path_inside_lumen_ratio
+min_path_inside_lumen_ratio
+paths_below_095_inside_lumen
+```
+
+Accept the model only if ground-truth branch recall/centerline coverage and airway depth improve without a large increase in short/noisy terminal branches. `gt_branch_recall_*` is the key branch-completeness metric; `gt_centerline_coverage_*` measures how much of the true airway centerline is recovered by the predicted skeleton.
+
+### Ablation Comparison
+
+For the report, compare the final method against baseline/postprocessing variants:
+
+```bash
+sbatch ablation_validation_gpu.sh
+```
+
+This runs:
+
+```text
+baseline checkpoint, threshold 0.2, prune 12
+topology checkpoint, threshold 0.2, prune 12
+topology checkpoint, threshold 0.2, no pruning
+topology checkpoint, threshold 0.3, prune 12
+```
+
+The summary table is written to:
+
+```text
+/home/opat90op/AMS_Project/datasets_new/final_validation/ablations/ablation_summary_table.md
+```
+
+For the final report, use this table to show whether the topology-aware checkpoint and chosen cleanup settings improve branch recall without adding noisy branches.
 
 ## Notes On LIDC Generalization
 

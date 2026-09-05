@@ -1,9 +1,10 @@
 from pathlib import Path
+import os
 import numpy as np
 
-home = Path.home()
-PROJECT_ROOT = home / "AMS_Project"
-PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
+PROCESSED_DIR = Path(
+    os.environ.get("AVB_DATA_ROOT", Path.home() / "AMS_Project" / "datasets_new")
+) / "processed_airrc"
 
 IMAGE_DIR = PROCESSED_DIR / "images"
 TARGET_DIR = PROCESSED_DIR / "targets"

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=airrc_patches
+#SBATCH --job-name=lidc_case
 #SBATCH --partition=gpu-stud
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=23:59:00
-#SBATCH --output=airrc_patches_%j.out
-#SBATCH --error=airrc_patches_%j.err
+#SBATCH --mem=24G
+#SBATCH --time=04:00:00
+#SBATCH --output=lidc_case_%j.out
+#SBATCH --error=lidc_case_%j.err
 
 set -euo pipefail
 
@@ -19,8 +19,4 @@ if [[ -f "$ENV_ACTIVATE" ]]; then
 fi
 
 PYTHON_BIN=${AVB_PYTHON:-python}
-"$PYTHON_BIN" -u extract_airrc_patches.py \
-  --patches-per-case 32 \
-  --distal-patch-fraction 0.5 \
-  --boundary-patch-fraction 0.3 \
-  --distal-radius-percentile 35
+"$PYTHON_BIN" -u run_lidc_case.py --device cuda --amp "$@"

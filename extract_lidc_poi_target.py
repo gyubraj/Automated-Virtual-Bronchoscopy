@@ -11,7 +11,7 @@ except ImportError:
     sitk = None
 
 
-def read_dicom_series(dicom_dir):
+def read_dicom_series(dicom_dir, series_uid=None):
     if sitk is None:
         raise RuntimeError("SimpleITK is required. Install it with: pip install SimpleITK")
 
@@ -19,15 +19,27 @@ def read_dicom_series(dicom_dir):
     series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
 
     if series_ids:
-        files = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
+        series_ids = list(series_ids)
+        if series_uid is None:
+            if len(series_ids) > 1:
+                raise RuntimeError(
+                    f"Found {len(series_ids)} DICOM series in {dicom_dir}. "
+                    "Pass --series-uid or use metadata with selected_series_uid."
+                )
+            series_uid = series_ids[0]
+        elif series_uid not in series_ids:
+            raise RuntimeError(f"Requested DICOM series UID not found in {dicom_dir}: {series_uid}")
+        files = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_uid)
     else:
+        if series_uid is not None:
+            raise RuntimeError("Cannot select --series-uid because no DICOM series IDs were found.")
         files = reader.GetGDCMSeriesFileNames(str(dicom_dir))
 
     if not files:
         raise RuntimeError(f"No DICOM files found in {dicom_dir}")
 
     reader.SetFileNames(files)
-    return reader.Execute()
+    return reader.Execute(), series_uid
 
 
 def make_resampled_reference(meta):
@@ -61,6 +73,23 @@ def iter_descendants(element, name):
     for child in element.iter():
         if strip_namespace(child.tag) == name:
             yield child
+
+
+def extract_xml_series_uids(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    uids = []
+    seen = set()
+
+    for element in root.iter():
+        if strip_namespace(element.tag).lower() != "seriesinstanceuid":
+            continue
+        text = (element.text or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            uids.append(text)
+
+    return uids
 
 
 def parse_float(value):
@@ -146,6 +175,12 @@ def main():
     parser.add_argument("--dicom-dir", required=True, help="Original CT DICOM folder used for preprocessing")
     parser.add_argument("--metadata", required=True, help="processed_lidc metadata JSON for the resampled CT")
     parser.add_argument("--output-json", required=True, help="Output target POI JSON")
+    parser.add_argument("--series-uid", default=None, help="Explicit CT SeriesInstanceUID to use")
+    parser.add_argument(
+        "--allow-series-mismatch",
+        action="store_true",
+        help="Continue even if the XML SeriesInstanceUID does not match the DICOM/metadata series.",
+    )
     args = parser.parse_args()
 
     if sitk is None:
@@ -154,7 +189,21 @@ def main():
     with open(args.metadata, "r") as f:
         meta = json.load(f)
 
-    original_img = read_dicom_series(args.dicom_dir)
+    metadata_series_uid = meta.get("selected_series_uid")
+    requested_series_uid = args.series_uid or metadata_series_uid
+    xml_series_uids = extract_xml_series_uids(args.xml)
+
+    if xml_series_uids and requested_series_uid and requested_series_uid not in xml_series_uids:
+        message = (
+            "XML SeriesInstanceUID does not match selected DICOM series. "
+            f"xml={xml_series_uids} selected={requested_series_uid}"
+        )
+        if args.allow_series_mismatch:
+            print("[WARN]", message)
+        else:
+            raise RuntimeError(message)
+
+    original_img, selected_series_uid = read_dicom_series(args.dicom_dir, series_uid=requested_series_uid)
     resampled_img = make_resampled_reference(meta)
     nodules = extract_nodule_annotations(args.xml)
 
@@ -167,6 +216,9 @@ def main():
         "xml": str(Path(args.xml)),
         "dicom_dir": str(Path(args.dicom_dir)),
         "metadata": str(Path(args.metadata)),
+        "xml_series_uids": xml_series_uids,
+        "selected_series_uid": selected_series_uid,
+        "metadata_series_uid": metadata_series_uid,
         "target_count": len(targets),
         "targets": targets,
     }
@@ -178,6 +230,7 @@ def main():
 
     print("Done")
     print("  targets:", len(targets))
+    print("  selected series uid:", selected_series_uid)
     print("  output:", output_json)
     for index, target in enumerate(targets[:10]):
         print(

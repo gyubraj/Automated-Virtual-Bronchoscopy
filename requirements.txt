@@ -1,0 +1,14 @@
+# Install a PyTorch build suitable for the target CPU/CUDA environment first.
+# See README.md. Keeping torch out of this file avoids replacing a cluster's
+# CUDA-enabled build with an incompatible wheel.
+numpy>=1.24,<3
+scipy>=1.10,<2
+SimpleITK>=2.2,<3
+nibabel>=5,<6
+scikit-image>=0.23,<1
+matplotlib>=3.7,<4
+pyvista>=0.43,<1
+vtk>=9.2,<10
+imageio>=2.31,<3
+pillow>=9.5
+idc-index

@@ -1,18 +1,18 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
 
-home = Path.home()
-PROJECT_ROOT = home / "AMS_Project"
+DATA_ROOT = Path(os.environ.get("AVB_DATA_ROOT", Path.home() / "AMS_Project" / "datasets_new"))
 
-AIRRC_DIR = PROJECT_ROOT / "datasets_new" / "airrc"
+AIRRC_DIR = DATA_ROOT / "airrc"
 LABEL_DIR = AIRRC_DIR / "labelsTr"
 
-DICOM_ROOT = PROJECT_ROOT / "datasets_new" / "lidc" / "lidc_idri"
+DICOM_ROOT = DATA_ROOT / "lidc" / "lidc_idri"
 
-OUT_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
+OUT_DIR = DATA_ROOT / "processed_airrc"
 IMAGE_OUT = OUT_DIR / "images"
 TARGET_OUT = OUT_DIR / "targets"
 META_OUT = OUT_DIR / "metadata"
