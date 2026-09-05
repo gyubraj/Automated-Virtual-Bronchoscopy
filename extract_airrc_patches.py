@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import json
+import os
 import random
 
 import numpy as np
@@ -9,7 +10,13 @@ from scipy import ndimage as ndi
 try:
     from skimage.morphology import skeletonize_3d as sk_skeletonize_3d
 except ImportError:
-    sk_skeletonize_3d = None
+    try:
+        from skimage.morphology import skeletonize as sk_skeletonize
+
+        def sk_skeletonize_3d(volume):
+            return sk_skeletonize(volume)
+    except ImportError:
+        sk_skeletonize_3d = None
 
 
 def make_ball(radius):
@@ -27,14 +34,13 @@ def skeletonize_lumen_for_sampling(lumen):
         return None
     return sk_skeletonize_3d(lumen).astype(bool)
 
-home = Path.home()
-PROJECT_ROOT = home / "AMS_Project"
+DATA_ROOT = Path(os.environ.get("AVB_DATA_ROOT", Path.home() / "AMS_Project" / "datasets_new"))
 
-PROCESSED_DIR = PROJECT_ROOT / "datasets_new" / "processed_airrc"
+PROCESSED_DIR = DATA_ROOT / "processed_airrc"
 IMAGE_DIR = PROCESSED_DIR / "images"
 TARGET_DIR = PROCESSED_DIR / "targets"
 
-PATCH_DIR = PROJECT_ROOT / "datasets_new" / "airrc_patches"
+PATCH_DIR = DATA_ROOT / "airrc_patches"
 PATCH_IMAGE_DIR = PATCH_DIR / "images"
 PATCH_TARGET_DIR = PATCH_DIR / "targets"
 SPLIT_DIR = PATCH_DIR / "splits"

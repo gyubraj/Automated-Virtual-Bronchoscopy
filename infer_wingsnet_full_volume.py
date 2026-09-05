@@ -38,12 +38,29 @@ def should_normalize_ct(ct):
     return not (-0.1 <= min_value <= 1.1 and -0.1 <= max_value <= 1.1)
 
 
-def load_dicom_series(ct_dir):
+def load_dicom_series(ct_dir, series_uid=None):
     if sitk is None:
         raise RuntimeError("SimpleITK is required to read DICOM folders.")
 
     reader = sitk.ImageSeriesReader()
-    dicom_files = reader.GetGDCMSeriesFileNames(str(ct_dir))
+    series_ids = reader.GetGDCMSeriesIDs(str(ct_dir))
+
+    if series_ids:
+        series_ids = list(series_ids)
+        if series_uid is None:
+            if len(series_ids) > 1:
+                raise RuntimeError(
+                    f"Found {len(series_ids)} DICOM series in {ct_dir}. "
+                    "Pass --series-uid to avoid using the wrong CT series."
+                )
+            series_uid = series_ids[0]
+        elif series_uid not in series_ids:
+            raise RuntimeError(f"Requested DICOM series UID not found in {ct_dir}: {series_uid}")
+        dicom_files = reader.GetGDCMSeriesFileNames(str(ct_dir), series_uid)
+    else:
+        if series_uid is not None:
+            raise RuntimeError("Cannot select --series-uid because no DICOM series IDs were found.")
+        dicom_files = reader.GetGDCMSeriesFileNames(str(ct_dir))
 
     if not dicom_files:
         raise RuntimeError(f"No DICOM files found in {ct_dir}")
@@ -55,12 +72,12 @@ def load_dicom_series(ct_dir):
     return volume, image
 
 
-def load_ct(input_path, normalize=True):
+def load_ct(input_path, normalize=True, series_uid=None):
     input_path = Path(input_path)
     reference_img = None
 
     if input_path.is_dir():
-        ct, reference_img = load_dicom_series(input_path)
+        ct, reference_img = load_dicom_series(input_path, series_uid=series_uid)
     elif input_path.suffix == ".npy":
         ct = np.load(input_path)
     elif input_path.name.endswith(".nii.gz") or input_path.suffix == ".nii":
@@ -108,7 +125,7 @@ def clean_state_dict(state_dict):
     return cleaned
 
 
-def load_checkpoint(model, checkpoint_path, device):
+def load_checkpoint(model, checkpoint_path, device, allow_partial=False):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(checkpoint, dict):
@@ -120,11 +137,12 @@ def load_checkpoint(model, checkpoint_path, device):
     if not isinstance(checkpoint, dict):
         raise RuntimeError("Checkpoint does not contain a valid state_dict.")
 
-    missing, unexpected = model.load_state_dict(clean_state_dict(checkpoint), strict=False)
-    if missing:
-        print("[WARN] Missing checkpoint keys:", len(missing))
-    if unexpected:
-        print("[WARN] Unexpected checkpoint keys:", len(unexpected))
+    missing, unexpected = model.load_state_dict(clean_state_dict(checkpoint), strict=not allow_partial)
+    if allow_partial:
+        if missing:
+            print("[WARN] Missing checkpoint keys:", len(missing))
+        if unexpected:
+            print("[WARN] Unexpected checkpoint keys:", len(unexpected))
     model.to(device)
     model.eval()
     return model
@@ -259,6 +277,7 @@ def main():
     parser.add_argument("--checkpoint", default="saved_model/wingsnet_best.pth", help="Path to wingsnet_best.pth")
     parser.add_argument("--ct", required=True, help="Full CT input: processed .npy, NIfTI, or DICOM folder")
     parser.add_argument("--output-dir", default="datasets/predictions", help="Folder for prediction outputs")
+    parser.add_argument("--series-uid", default=None, help="Required when --ct is a DICOM folder containing multiple series")
     parser.add_argument("--model-module", default="WingsNet", help="Python module containing the model class")
     parser.add_argument("--model-class", default="WingsNet", help="Model class name")
     parser.add_argument("--model-kwargs", default="{}", help="JSON dict passed to model constructor")
@@ -270,6 +289,11 @@ def main():
     parser.add_argument("--save-binary", action="store_true", help="Also save thresholded binary masks")
     parser.add_argument("--save-nifti", action="store_true", help="Also save NIfTI outputs when CT metadata is available")
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision during inference")
+    parser.add_argument(
+        "--allow-partial-checkpoint",
+        action="store_true",
+        help="Allow missing/unexpected checkpoint keys. Use only for deliberate architecture migration.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -279,12 +303,12 @@ def main():
     model_kwargs = json.loads(args.model_kwargs)
 
     print("Loading CT:", args.ct)
-    ct, reference_img = load_ct(args.ct, normalize=not args.no_normalize)
+    ct, reference_img = load_ct(args.ct, normalize=not args.no_normalize, series_uid=args.series_uid)
     print("  CT shape:", ct.shape)
 
     print("Loading model:", args.model_module, args.model_class)
     model = import_model(args.model_module, args.model_class, model_kwargs)
-    model = load_checkpoint(model, args.checkpoint, device)
+    model = load_checkpoint(model, args.checkpoint, device, allow_partial=args.allow_partial_checkpoint)
 
     print("Running inference")
     print("  checkpoint:", args.checkpoint)

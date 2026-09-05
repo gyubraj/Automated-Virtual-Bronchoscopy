@@ -1,6 +1,42 @@
-saved_model/
-AMS_Implementation_Steps.pdf
+# Local Python environments and tooling
+.venv/
+venv/
+env/
 idc_env/
 __pycache__/
-docker/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Model checkpoints and training artifacts
+saved_model/
+saved_model_distal/
+saved_model_topology/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# Local datasets and generated pipeline outputs
 data/
+datasets/
+outputs/
+predictions/
+visualizations/
+processed_*/
+*_patches/
+centerlines/
+final_validation/
+
+# Scheduler, experiment, and runtime logs
+*.err
+*.out
+*.log
+
+# Large/local documentation and generated media
+AMS_Implementation_Steps.pdf
+*.gif
+*.mp4

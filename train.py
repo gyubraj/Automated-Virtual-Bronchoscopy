@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -228,7 +229,7 @@ def log(message, *values):
     print(message, *values, flush=True)
 
 
-def load_resume_checkpoint(model, optimizer, resume_path, device, fine_tune=False):
+def load_resume_checkpoint(model, optimizer, resume_path, device, fine_tune=False, allow_partial=False):
     if resume_path is None:
         return 0, float("inf"), 0.0
 
@@ -259,11 +260,12 @@ def load_resume_checkpoint(model, optimizer, resume_path, device, fine_tune=Fals
     else:
         raise RuntimeError("Unsupported checkpoint format.")
 
-    missing, unexpected = model.load_state_dict(clean_state_dict(state_dict), strict=False)
-    if missing:
-        print("[WARN] Missing checkpoint keys:", len(missing))
-    if unexpected:
-        print("[WARN] Unexpected checkpoint keys:", len(unexpected))
+    missing, unexpected = model.load_state_dict(clean_state_dict(state_dict), strict=not allow_partial)
+    if allow_partial:
+        if missing:
+            print("[WARN] Missing checkpoint keys:", len(missing))
+        if unexpected:
+            print("[WARN] Unexpected checkpoint keys:", len(unexpected))
     mode = "fine-tune weights only" if fine_tune else "resume training"
     log("resumed checkpoint:", resume_path)
     log("resume mode:", mode)
@@ -272,20 +274,24 @@ def load_resume_checkpoint(model, optimizer, resume_path, device, fine_tune=Fals
 
 
 def parse_args():
-    home = Path.home()
-    project_root = home / "AMS_Project"
+    data_root = Path(os.environ.get("AVB_DATA_ROOT", Path.home() / "AMS_Project" / "datasets_new"))
     parser = argparse.ArgumentParser(description="Train WingsNet with distal-airway-aware sampling/loss.")
     parser.add_argument(
         "--train-json",
-        default=str(project_root / "datasets_new" / "airrc_patches" / "splits" / "train.json"),
+        default=str(data_root / "airrc_patches" / "splits" / "train.json"),
     )
     parser.add_argument(
         "--val-json",
-        default=str(project_root / "datasets_new" / "airrc_patches" / "splits" / "val.json"),
+        default=str(data_root / "airrc_patches" / "splits" / "val.json"),
     )
     parser.add_argument("--save-dir", default="./saved_model")
     parser.add_argument("--resume", default=None, help="Optional checkpoint/state_dict to fine-tune from")
     parser.add_argument("--fine-tune", action="store_true", help="Load model weights but reset optimizer and epoch count")
+    parser.add_argument(
+        "--allow-partial-checkpoint",
+        action="store_true",
+        help="Allow missing/unexpected checkpoint keys. Use only for deliberate architecture migration.",
+    )
     parser.add_argument("--epochs", type=int, default=100, help="Epochs to run; with --fine-tune this is additional epochs")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -363,6 +369,7 @@ def train():
         args.resume,
         device,
         fine_tune=args.fine_tune,
+        allow_partial=args.allow_partial_checkpoint,
     )
 
     end_epoch = start_epoch + args.epochs if args.fine_tune else args.epochs

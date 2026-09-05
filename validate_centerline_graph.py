@@ -245,6 +245,122 @@ def timi_tree_parse_metrics(lumen_mask, skeleton, min_branch_voxels=5):
     }
 
 
+def timi_parse_details(lumen_mask, skeleton, min_branch_voxels=5):
+    skeleton_parse, branch_labels, branch_count = timi_skeleton_parsing(
+        skeleton,
+        min_branch_voxels=min_branch_voxels,
+    )
+    if branch_count == 0:
+        return skeleton_parse, branch_labels, branch_count, None, None, None
+
+    tree_parsing = timi_tree_parsing(skeleton_parse, lumen_mask.astype(np.uint8), branch_labels)
+    trachea_label = timi_loc_trachea(tree_parsing, branch_count)
+    if trachea_label is None:
+        return skeleton_parse, branch_labels, branch_count, tree_parsing, None, None
+
+    adjacency = timi_adjacent_map(tree_parsing, branch_count)
+    _, _, generation, processed = timi_parent_children_map(adjacency, trachea_label)
+    generation = np.asarray(generation, dtype=np.int64)
+    generation[processed == 0] = -1
+    return skeleton_parse, branch_labels, branch_count, tree_parsing, generation, processed
+
+
+def gt_branch_recall_by_generation(
+    gt_lumen,
+    gt_skeleton,
+    pred_skeleton,
+    distance_tolerance=3.0,
+    branch_coverage_threshold=0.8,
+    min_branch_voxels=5,
+):
+    skeleton_parse, branch_labels, branch_count, _, generation, processed = timi_parse_details(
+        gt_lumen,
+        gt_skeleton,
+        min_branch_voxels=min_branch_voxels,
+    )
+    if branch_count == 0:
+        return {
+            "gt_parsed_branch_count": 0,
+            "gt_reachable_branch_count": 0,
+            "detected_branch_count": 0,
+            "branch_recall": None,
+            "distance_tolerance_voxels": float(distance_tolerance),
+            "branch_coverage_threshold": float(branch_coverage_threshold),
+            "by_generation": {},
+        }
+
+    if int(pred_skeleton.sum()) == 0:
+        distance_map = np.full(gt_skeleton.shape, np.inf, dtype=np.float32)
+    else:
+        distance_map = ndi.distance_transform_edt(~pred_skeleton.astype(bool))
+
+    records = []
+    by_generation = {}
+    for branch_id in range(1, branch_count + 1):
+        branch_mask = (branch_labels == branch_id) & (skeleton_parse > 0)
+        voxels = int(branch_mask.sum())
+        if voxels == 0:
+            continue
+
+        gen = None
+        is_reachable = True
+        if generation is not None and len(generation) >= branch_id:
+            gen_value = int(generation[branch_id - 1])
+            gen = gen_value if gen_value >= 0 else None
+            is_reachable = gen_value >= 0
+        if processed is not None and len(processed) >= branch_id:
+            is_reachable = is_reachable and bool(processed[branch_id - 1])
+
+        distances = distance_map[branch_mask]
+        coverage = float(np.mean(distances <= distance_tolerance))
+        detected = bool(coverage >= branch_coverage_threshold)
+        key = str(gen) if gen is not None else "unreached"
+
+        if key not in by_generation:
+            by_generation[key] = {
+                "gt_branch_count": 0,
+                "detected_branch_count": 0,
+                "mean_branch_coverage": 0.0,
+                "gt_skeleton_voxels": 0,
+            }
+
+        by_generation[key]["gt_branch_count"] += 1
+        by_generation[key]["detected_branch_count"] += int(detected)
+        by_generation[key]["mean_branch_coverage"] += coverage
+        by_generation[key]["gt_skeleton_voxels"] += voxels
+
+        records.append({
+            "branch_id": int(branch_id),
+            "generation": gen,
+            "reachable_from_gt_trachea": bool(is_reachable),
+            "gt_skeleton_voxels": voxels,
+            "coverage": coverage,
+            "detected": detected,
+            "mean_distance_to_prediction": float(np.mean(distances)),
+            "max_distance_to_prediction": float(np.max(distances)),
+        })
+
+    for entry in by_generation.values():
+        count = entry["gt_branch_count"]
+        entry["branch_recall"] = float(entry["detected_branch_count"] / count) if count else None
+        entry["mean_branch_coverage"] = float(entry["mean_branch_coverage"] / count) if count else None
+
+    reachable_records = [record for record in records if record["reachable_from_gt_trachea"]]
+    denominator = len(reachable_records)
+    detected_count = sum(1 for record in reachable_records if record["detected"])
+
+    return {
+        "gt_parsed_branch_count": int(branch_count),
+        "gt_reachable_branch_count": int(denominator),
+        "detected_branch_count": int(detected_count),
+        "branch_recall": float(detected_count / denominator) if denominator else None,
+        "distance_tolerance_voxels": float(distance_tolerance),
+        "branch_coverage_threshold": float(branch_coverage_threshold),
+        "by_generation": by_generation,
+        "branches": records,
+    }
+
+
 def graph_adjacency(graph):
     adjacency = {int(node["id"]): [] for node in graph.get("nodes", [])}
     coords = {int(node["id"]): tuple(node["zyx"]) for node in graph.get("nodes", [])}
@@ -408,6 +524,43 @@ def point_distance_metrics(source_mask, target_mask):
     }
 
 
+def point_coverage_metrics(source_mask, target_mask, tolerances=(1, 2, 3, 5)):
+    source = np.argwhere(source_mask)
+    target = np.argwhere(target_mask)
+
+    if len(source) == 0 or len(target) == 0:
+        return {f"coverage_within_{tol}_voxels": None for tol in tolerances}
+
+    tree = cKDTree(target)
+    distances, _ = tree.query(source, k=1)
+
+    return {
+        f"coverage_within_{tol}_voxels": float(np.mean(distances <= tol))
+        for tol in tolerances
+    }
+
+
+def binary_overlap_metrics(pred_mask, gt_mask):
+    pred = pred_mask.astype(bool)
+    gt = gt_mask.astype(bool)
+    tp = int((pred & gt).sum())
+    fp = int((pred & ~gt).sum())
+    fn = int((~pred & gt).sum())
+
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    dice = (2 * tp) / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 0.0
+
+    return {
+        "true_positive_voxels": tp,
+        "false_positive_voxels": fp,
+        "false_negative_voxels": fn,
+        "dice": float(dice),
+        "precision": float(precision),
+        "recall": float(recall),
+    }
+
+
 def path_inside_lumen_stats(paths, lumen_mask):
     records = []
 
@@ -438,6 +591,27 @@ def path_inside_lumen_stats(paths, lumen_mask):
     return records
 
 
+def path_inside_lumen_summary(records, safety_threshold=0.95):
+    if not records:
+        return {
+            "path_count": 0,
+            "mean_inside_lumen_ratio": None,
+            "min_inside_lumen_ratio": None,
+            "paths_below_safety_threshold": 0,
+            "safety_threshold": float(safety_threshold),
+        }
+
+    ratios = [float(record.get("inside_lumen_ratio", 0.0)) for record in records]
+    return {
+        "path_count": int(len(records)),
+        "mean_inside_lumen_ratio": float(np.mean(ratios)),
+        "min_inside_lumen_ratio": float(np.min(ratios)),
+        "max_inside_lumen_ratio": float(np.max(ratios)),
+        "paths_below_safety_threshold": int(sum(ratio < safety_threshold for ratio in ratios)),
+        "safety_threshold": float(safety_threshold),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate airway centerline graph/path quality.")
     parser.add_argument("--pred-lumen", required=True, help="Predicted lumen mask/probability .npy")
@@ -451,12 +625,22 @@ def main():
     parser.add_argument("--target-lumen-channel", type=int, default=0, help="Target lumen channel")
     parser.add_argument("--timi-tree-parse", action="store_true", help="Add TIMI-style branch parsing metrics")
     parser.add_argument("--timi-min-branch-voxels", type=int, default=5, help="Minimum parsed branch size")
+    parser.add_argument("--path-safety-threshold", type=float, default=0.95, help="Flag paths below this lumen occupancy")
+    parser.add_argument("--branch-recall-distance", type=float, default=3.0, help="GT branch detection distance tolerance")
+    parser.add_argument(
+        "--branch-recall-coverage",
+        type=float,
+        default=0.8,
+        help="Minimum fraction of a GT branch within tolerance to count as detected",
+    )
     args = parser.parse_args()
 
     pred_lumen = load_volume(args.pred_lumen, threshold=args.threshold)
     pred_skeleton = load_volume(args.skeleton, threshold=0.5)
     graph = load_graph(args.graph_json)
     paths = load_paths(args.paths_json)
+
+    path_records = path_inside_lumen_stats(paths, pred_lumen)
 
     metrics = {
         "inputs": {
@@ -474,7 +658,11 @@ def main():
         "graph_total_length_voxels": graph_total_length(graph),
         "terminal_branches": short_terminal_branch_stats(graph, max_length=args.short_branch_length),
         "path_count": int(len(paths)),
-        "paths": path_inside_lumen_stats(paths, pred_lumen),
+        "path_inside_lumen_summary": path_inside_lumen_summary(
+            path_records,
+            safety_threshold=args.path_safety_threshold,
+        ),
+        "paths": path_records,
     }
 
     if args.timi_tree_parse:
@@ -489,15 +677,28 @@ def main():
         gt_skeleton = skeletonize(gt_lumen)
         pred_to_gt = point_distance_metrics(pred_skeleton, gt_skeleton)
         gt_to_pred = point_distance_metrics(gt_skeleton, pred_skeleton)
+        pred_to_gt_coverage = point_coverage_metrics(pred_skeleton, gt_skeleton)
+        gt_to_pred_coverage = point_coverage_metrics(gt_skeleton, pred_skeleton)
         gt_length = skeleton_length(gt_skeleton)
         pred_length = graph_total_length(graph)
 
         metrics["ground_truth"] = {
             "gt_lumen_components": component_stats(gt_lumen, connectivity=1),
             "gt_skeleton_components": component_stats(gt_skeleton, connectivity=3),
+            "lumen_overlap": binary_overlap_metrics(pred_lumen, gt_lumen),
             "gt_centerline_length_voxels": gt_length,
             "pred_to_gt_centerline_distance": pred_to_gt,
             "gt_to_pred_centerline_distance": gt_to_pred,
+            "pred_to_gt_centerline_coverage": pred_to_gt_coverage,
+            "gt_to_pred_centerline_coverage": gt_to_pred_coverage,
+            "gt_branch_recall_by_generation": gt_branch_recall_by_generation(
+                gt_lumen=gt_lumen,
+                gt_skeleton=gt_skeleton,
+                pred_skeleton=pred_skeleton,
+                distance_tolerance=args.branch_recall_distance,
+                branch_coverage_threshold=args.branch_recall_coverage,
+                min_branch_voxels=args.timi_min_branch_voxels,
+            ),
             "symmetric_mean_centerline_distance": (
                 float((pred_to_gt["mean_distance"] + gt_to_pred["mean_distance"]) / 2.0)
                 if pred_to_gt["mean_distance"] is not None and gt_to_pred["mean_distance"] is not None

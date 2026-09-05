@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+import os
 import subprocess
 import sys
 
@@ -54,7 +55,12 @@ def main():
     )
     parser.add_argument("--ct", required=True, help="Full CT input: processed .npy, NIfTI, or DICOM folder")
     parser.add_argument("--case-id", default=None, help="Case id for output folders; inferred from --ct if omitted")
-    parser.add_argument("--data-root", default="/home/opat90op/AMS_Project/datasets_new", help="Dataset/output root")
+    parser.add_argument(
+        "--data-root",
+        default=os.environ.get("AVB_DATA_ROOT", str(Path.home() / "AMS_Project" / "datasets_new")),
+        help="Dataset/output root; defaults to AVB_DATA_ROOT or ~/AMS_Project/datasets_new",
+    )
+    parser.add_argument("--series-uid", default=None, help="Required when --ct is a DICOM folder containing multiple series")
     parser.add_argument("--checkpoint", default="saved_model/wingsnet_best.pth", help="WingsNet checkpoint")
     parser.add_argument("--model-module", default="WingsNet", help="Python module containing the model class")
     parser.add_argument("--model-class", default="WingsNet", help="Model class name")
@@ -65,6 +71,11 @@ def main():
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision during inference")
     parser.add_argument("--no-normalize", action="store_true", help="Skip CT HU normalization")
     parser.add_argument("--save-nifti", action="store_true", help="Save NIfTI predictions when CT metadata is available")
+    parser.add_argument(
+        "--skip-inference",
+        action="store_true",
+        help="Reuse pred_lumen.npy and pred_wall.npy already present in the case prediction folder",
+    )
     parser.add_argument("--mask-threshold", type=float, default=0.5, help="Threshold used for saved binary masks")
     parser.add_argument("--skeleton-threshold", type=float, default=0.2, help="Threshold used for centerline/path/mesh")
     parser.add_argument(
@@ -129,6 +140,12 @@ def main():
     parser.add_argument("--max-graph-generation", type=int, default=None, help="Maximum skeleton generation to render")
     parser.add_argument("--make-video", action="store_true", help="Also create a rotating GIF validation video")
     parser.add_argument("--no-xvfb", action="store_true", help="Do not try to start xvfb for PyVista rendering")
+    parser.add_argument(
+        "--stop-after",
+        choices=["inference", "skeleton", "smoothing", "visualization"],
+        default="visualization",
+        help="Stop after the selected pipeline stage; useful when constructing a graph before target selection",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them")
     args = parser.parse_args()
 
@@ -152,6 +169,10 @@ def main():
         args.ct,
         "--output-dir",
         str(pred_dir),
+    ]
+    if args.series_uid is not None:
+        inference_cmd.extend(["--series-uid", args.series_uid])
+    inference_cmd.extend([
         "--model-module",
         args.model_module,
         "--model-class",
@@ -167,7 +188,7 @@ def main():
         "--threshold",
         str(args.mask_threshold),
         "--save-binary",
-    ]
+    ])
     parse_bool_flag(inference_cmd, args.amp, "--amp")
     parse_bool_flag(inference_cmd, args.no_normalize, "--no-normalize")
     parse_bool_flag(inference_cmd, args.save_nifti, "--save-nifti")
@@ -176,6 +197,17 @@ def main():
     pred_wall = pred_dir / "pred_wall.npy"
     pred_lumen_mask = pred_dir / "pred_lumen_mask.npy"
     pred_wall_mask = pred_dir / "pred_wall_mask.npy"
+
+    if args.skip_inference and not args.dry_run:
+        missing_predictions = [
+            path for path in (pred_lumen, pred_wall)
+            if not path.is_file()
+        ]
+        if missing_predictions:
+            missing_text = ", ".join(str(path) for path in missing_predictions)
+            raise FileNotFoundError(
+                "--skip-inference was requested, but prediction files are missing: " + missing_text
+            )
 
     skeleton_cmd = [
         python,
@@ -277,9 +309,33 @@ def main():
     print("Centerline dir:", centerline_dir)
     print("Visualization dir:", visualization_dir)
 
-    run_step("1. Full-volume WingsNet inference", inference_cmd, dry_run=args.dry_run)
+    if args.skip_inference:
+        print()
+        print("=" * 80)
+        print("1. Reuse existing full-volume WingsNet prediction")
+        print("=" * 80)
+        print("  pred lumen:", pred_lumen)
+        print("  pred wall:", pred_wall)
+    else:
+        run_step("1. Full-volume WingsNet inference", inference_cmd, dry_run=args.dry_run)
+    if args.stop_after == "inference":
+        print("Pipeline stopped after inference as requested.")
+        return
+
     run_step("2. Skeletonize lumen and plan path", skeleton_cmd, dry_run=args.dry_run)
+    if args.stop_after == "skeleton":
+        print("Pipeline stopped after skeleton/graph construction as requested.")
+        print("  pruned centerline graph:", pruned_graph_json)
+        print("  raw planned paths:", paths_json)
+        return
+
     run_step("3. Smooth planned centerline path", smooth_path_cmd, dry_run=args.dry_run)
+    if args.stop_after == "smoothing":
+        print("Pipeline stopped after path smoothing as requested.")
+        print("  smoothed navigation paths:", smoothed_paths_json)
+        return
+
+
     run_step("4. Export mesh and validation render", visualization_cmd, dry_run=args.dry_run)
 
     print()
